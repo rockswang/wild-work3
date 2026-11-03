@@ -1,0 +1,347 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>wild-work3 管理面板</title>
+<meta name="color-scheme" content="dark light">
+<link rel="icon" type="image/svg+xml" href="/favicon.svg">
+<!-- 主题预置：在样式表之前应用，避免首屏闪烁（FOUC） -->
+<script>
+(function () {
+  var el = document.documentElement, t = {};
+  try { t = JSON.parse(localStorage.getItem('ww3.theme') || '{}'); } catch (e) {}
+  var mode = t.mode || 'auto';
+  var dark = mode === 'dark' || (mode === 'auto' && !window.matchMedia('(prefers-color-scheme: light)').matches);
+  el.setAttribute('data-mode', dark ? 'dark' : 'light');
+  el.setAttribute('data-accent', t.accent || 'blue');
+})();
+</script>
+<link rel="stylesheet" href="/style.css">
+</head>
+<body>
+<div id="app">
+
+  <!-- 顶部 -->
+  <header class="topbar">
+    <div class="brand">
+      <div class="logo" id="logo">🛰</div>
+      <div class="brand-text">
+        <div class="title">wild-work3 <span class="ver" id="ver"></span></div>
+        <div class="sub" id="serverLine">本地服务</div>
+      </div>
+    </div>
+    <div class="top-info">
+      <div class="info-cell">
+        <span class="info-label">OpenAI接口</span>
+        <code class="info-value" id="apiAddr"><span class="val"></span></code>
+      </div>
+      <div class="info-cell">
+        <span class="info-label">API-Key</span>
+        <code class="info-value" id="apiKeyDisplay"><span class="val"></span></code>
+      </div>
+    </div>
+    <div class="top-icons">
+      <span class="icon-link" id="btnTheme" title="外观主题">🎨</span>
+      <span class="icon-link gear" id="btnSettings" title="设置">⚙</span>
+      <span class="icon-link" id="btnHelp" title="使用说明与风险声明">?</span>
+      <span class="icon-link" id="btnAbout" title="关于">i</span>
+    </div>
+  </header>
+
+  <!-- 主面板 -->
+  <section class="panel">
+    <div class="main-tabs">
+      <button class="mtab active" data-mtab="accounts">账号管理</button>
+      <button class="mtab" data-mtab="channels">渠道管理</button>
+      <button class="mtab" data-mtab="usage">用量与流水</button>
+      <button class="mtab" data-mtab="stats">运行统计</button>
+      <button class="mtab" data-mtab="fees">模型和费率</button>
+      <button class="mtab" data-mtab="plugins">插件与更新</button>
+    </div>
+
+    <!-- ===== Tab: 账号管理 ===== -->
+    <div class="mtab-body" id="mtabAccounts">
+      <div class="panel-head">
+        <div class="pa-group pa-left">
+          <button class="btn primary" id="btnRefreshAll">刷新积分</button>
+          <button class="btn" id="btnCheckinAll">全部签到</button>
+          <button class="btn" id="btnImportLocal" title="从插件私有目录导入已存在的登录凭据">导入本地凭据</button>
+          <label class="chk" title="勾选后一并显示冷却中/已停用/无额度的账号">
+            <input type="checkbox" id="acctShowNa" /> 显示不可用账号
+          </label>
+        </div>
+        <div class="pa-spacer"></div>
+      </div>
+      <div id="creditSummary" class="credit-summary hidden"></div>
+      <div id="acctList" class="acct-grid"></div>
+      <div id="acctEmpty" class="empty hidden">还没有账号，点击「＋ 添加渠道」添加</div>
+    </div>
+
+    <!-- ===== Tab: 渠道管理 ===== -->
+    <div class="mtab-body hidden" id="mtabChannels">
+      <div class="panel-head">
+        <div class="pa-group pa-left">
+          <button class="btn primary" id="btnAddChannel">＋ 添加渠道</button>
+          <div class="seg" id="chInfo"></div>
+        </div>
+      </div>
+      <div id="channelGrid" class="channel-grid"></div>
+    </div>
+
+    <!-- ===== Tab: 用量与流水 ===== -->
+    <div class="mtab-body hidden" id="mtabUsage">
+      <div class="panel-head">
+        <div class="pa-group">
+          <div class="seg" id="usageRange">
+            <button class="seg-btn" data-days="1">今日</button>
+            <button class="seg-btn active" data-days="7">7日</button>
+          </div>
+          <button class="btn small" id="btnRefreshUsage">刷新</button>
+        </div>
+      </div>
+      <div class="usage-cards">
+        <div class="ucard"><div class="ucard-label">Token 总量</div><div class="ucard-value" id="ucTokens">—</div></div>
+        <div class="ucard"><div class="ucard-label">请求数</div><div class="ucard-value" id="ucReqs">—</div></div>
+        <div class="ucard"><div class="ucard-label">积分消耗</div><div class="ucard-value warn" id="ucSpend">—</div></div>
+        <div class="ucard"><div class="ucard-label">积分入项</div><div class="ucard-value ok" id="ucEarn">—</div></div>
+        <div class="ucard"><div class="ucard-label">缓存利用率</div><div class="ucard-value" id="ucCache" title="缓存命中 token ÷ 上报该维度的请求的 prompt token">—</div></div>
+      </div>
+      <div id="usageChart"></div>
+      <div id="usageModels"></div>
+      <div id="usageList" class="usage-list"></div>
+      <div class="subtabs" id="usageSubs">
+        <button class="subtab active" data-usub="credits">积分流水</button>
+      </div>
+      <div class="subtab-body" id="subCredits"></div>
+    </div>
+
+    <!-- ===== Tab: 运行统计 ===== -->
+    <div class="mtab-body hidden" id="mtabStats">
+      <div class="stats-cards" id="statsCards"></div>
+      <div id="statsChart"></div>
+      <div id="statsChannels"></div>
+      <div id="statsModels"></div>
+      <div id="statsFallbacks"></div>
+      <div id="statsReqs"></div>
+      <div id="statsAbnormal"></div>
+      <div id="warnings" class="warnings"></div>
+      <div class="panel-head"><h3>运行日志</h3></div>
+      <pre id="logView" class="log"></pre>
+    </div>
+
+    <!-- ===== Tab: 模型和费率 ===== -->
+    <div class="mtab-body hidden" id="mtabFees">
+      <div class="panel-head"><div class="pa-group"><button class="btn small" id="btnRefreshFees">刷新</button><button class="btn small" id="btnModelSearch" title="跨全部渠道按关键字搜模型">模型查找</button></div></div>
+      <div id="feeList" class="fee-list"></div>
+    </div>
+
+    <!-- ===== Tab: 插件与更新 ===== -->
+    <div class="mtab-body hidden" id="mtabPlugins">
+      <div class="subtabs">
+        <button class="subtab active" data-sub="store">插件商店</button>
+        <button class="subtab" data-sub="installed">已安装插件</button>
+        <button class="subtab" data-sub="updates">核心升级</button>
+      </div>
+      <div class="subtab-body" id="subStore"></div>
+      <div class="subtab-body hidden" id="subInstalled"></div>
+      <div class="subtab-body hidden" id="subUpdates"></div>
+    </div>
+
+    <!-- ===== 设置 overlay（按职责分区：gateway 接口/安全 + core 业务策略） ===== -->
+    <div class="overlay hidden" id="settingsOverlay">
+      <div class="overlay-box wide">
+        <h3>设置</h3>
+        <div class="ov-body">
+          <div class="ov-note">① 接口与鉴权（gateway）</div>
+          <div class="field-row cols-3">
+            <label>监听主机<select id="setHost" class="ipt">
+              <option value="127.0.0.1">127.0.0.1（本机）</option>
+              <option value="0.0.0.0">0.0.0.0（全部）</option>
+              <option value="__custom__">自定义…</option>
+            </select></label>
+            <label id="setHostCustomRow" hidden>自定义主机<input id="setHostCustom" class="ipt" placeholder="如 192.168.1.100"></label>
+            <label>端口<input id="setPort" class="ipt" type="number" min="1" max="65535"></label>
+          </div>
+          <label>API-Key（/v1 鉴权，留空不校验）<input id="setApiKey" class="ipt"></label>
+          <div class="field-row">
+            <label>管理口令<input id="setAdminPass" class="ipt" type="password" placeholder="已设置（留空则不修改）"></label>
+            <div class="field-inline" style="align-self:end">
+              <button class="btn small" id="btnClearAdminPass">清除口令</button>
+              <button class="btn small" id="btnAdminLogout">退出登录</button>
+            </div>
+          </div>
+          <div class="ov-tip danger" id="listenRiskTip" hidden>⚠️ 监听 0.0.0.0 时必须设置管理口令，否则局域网内任何设备都可访问本 API 与账号管理。</div>
+          <label><input type="checkbox" id="setAutostart"> 开机自启（Windows 登录时自动启动）</label>
+
+          <div class="ov-note">② 模型路由（core）</div>
+          <div class="field-row">
+            <label>默认渠道<select id="setDefaultChannel" class="ipt"></select></label>
+            <label>封顶 tokens<input id="setMaxTok" class="ipt" type="number" min="0" placeholder="0 = 不限"></label>
+          </div>
+          <label>模型映射表（客户端模型名 = 渠道/模型名，支持通配 claude-* = workbuddy/glm-5.2，# 注释）
+            <textarea id="setModelMap" class="ipt" rows="4"></textarea></label>
+          <div class="hint" id="mapSummary"></div>
+
+          <div class="ov-note">③ 自动签到与开关（core）</div>
+          <label>签到时间（本地时区，可多个）<span class="time-list" id="checkinList"></span></label>
+          <div class="field-inline">
+            <input id="checkinNew" class="ipt" type="time" step="60" style="width:auto">
+            <button class="btn small" id="btnAddCheckin">＋ 时间</button>
+          </div>
+          <label><input type="checkbox" id="setLoopGuard"> 思考链防癫（流式检测思考链复读/空转，命中即中断返回错误）</label>
+          <label><input type="checkbox" id="setBodyLog"> 请求体摘要（写入 data/ledger/body-trace-*.jsonl）</label>
+
+          <div class="ov-note">④ 备用上游通道（core）</div>
+          <label>备用代理（http/https/socks5，留空=关闭）<input id="setProxy" class="ipt" placeholder="http://127.0.0.1:10809"></label>
+          <div class="hint">全局只配一个；不参与常规请求，仅渠道命中地区拒绝时自动取用。</div>
+
+          <div class="ov-note">⑤ 模型降级链（core）</div>
+          <label>规则（原模型 = 备胎1,备胎2；原模型在该渠道全部账号限流冷却时按顺序尝试）
+            <textarea id="setFallback" class="ipt" rows="3"></textarea></label>
+
+          <div class="ov-note">⑥ 思考强度（core）</div>
+          <label>注入映射（模型 = 档位；* 为全局默认；客户端显式传了 reasoning_effort 的一律不覆盖）
+            <textarea id="setEfforts" class="ipt" rows="3"></textarea></label>
+
+          <div class="ov-note">⑦ 请求改写规则（config.json 的 rules 段，W3-35）</div>
+          <div class="hint">默认规则集（developer→system + 出站脱敏）内嵌在程序里，无需填写。此处只需写「覆盖」：
+            给对象 = 改该规则的字段，给 <code>{}</code> = 删除该默认规则，新 ID = 追加。
+            带 <code>scope.channels</code> 的规则只在指定渠道生效（core 侧 Pass B），否则在网关路由前对全部请求生效。</div>
+          <label>用户覆盖段（JSON，留空 = 全默认）
+            <textarea id="setRules" class="ipt mono" rows="8" placeholder='{"rules":{"sanitize.cc-kv":{},"my.rule":{"kind":"regex","regex":"foo","replacement":"bar","anchor":"foo","order":900}}}'></textarea></label>
+          <div class="field-inline">
+            <button class="btn small" id="btnRulesReload">重新载入</button>
+            <span class="hint" id="rulesSummary"></span>
+          </div>
+        </div>
+        <div class="ov-actions">
+          <button class="btn" id="setCancel">取消</button>
+          <button class="btn primary" id="setSave">保存</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- ===== 添加渠道 wizard overlay ===== -->
+    <div class="overlay hidden" id="channelWizard">
+      <div class="overlay-box wide">
+        <h3 id="cwTitle">添加渠道</h3>
+        <div class="ov-body" id="cwBody"></div>
+        <div class="ov-actions">
+          <button class="btn" id="cwPrev" hidden>上一步</button>
+          <button class="btn" id="cwCancel">取消</button>
+          <button class="btn primary" id="cwNext">下一步</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- ===== 登录授权 overlay（authflow 六范式，UI 由 type 驱动） ===== -->
+    <div class="overlay hidden" id="loginOverlay">
+      <div class="overlay-box wide">
+        <h3 id="loTitle">登录账号</h3>
+        <div class="ov-body" id="loBody"></div>
+        <div class="ov-actions">
+          <button class="btn" id="loCancel">取消</button>
+          <button class="btn" id="loSubmit" hidden>提交</button>
+          <button class="btn primary" id="loStart">开始登录</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- ===== 主题 overlay（模式 + 强调色） ===== -->
+    <div class="overlay hidden" id="themeOverlay">
+      <div class="overlay-box">
+        <h3>外观主题</h3>
+        <div class="ov-body">
+          <div class="ov-note">模式</div>
+          <div class="seg theme-mode-seg" id="themeMode">
+            <button class="seg-btn" data-mode="dark">暗色</button>
+            <button class="seg-btn" data-mode="light">亮色</button>
+            <button class="seg-btn" data-mode="auto">跟随系统</button>
+          </div>
+          <div class="ov-note">强调色</div>
+          <div class="theme-accents" id="themeAccents"></div>
+        </div>
+        <div class="ov-actions"><button class="btn" id="themeClose">关闭</button></div>
+      </div>
+    </div>
+
+    <!-- ===== 关于 overlay ===== -->
+    <div class="overlay hidden" id="aboutOverlay">
+      <div class="overlay-box">
+        <h3>关于 wild-work3</h3>
+        <div class="ov-body" id="aboutBody"></div>
+        <div class="ov-actions"><button class="btn" id="aboutClose">关闭</button></div>
+      </div>
+    </div>
+
+    <!-- ===== 使用说明与风险声明 ===== -->
+    <div class="overlay hidden" id="helpOverlay">
+      <div class="overlay-box wide">
+        <h3>使用说明与风险声明</h3>
+        <div class="ov-body" id="helpBody"></div>
+        <div class="ov-actions"><button class="btn" id="helpClose">关闭</button></div>
+      </div>
+    </div>
+
+    <!-- ===== 管理面板登录（gateway 管理口令） ===== -->
+    <div class="overlay hidden" id="adminLoginOverlay">
+      <div class="overlay-box narrow">
+        <h3>管理面板登录</h3>
+        <div class="ov-body">
+          <div class="ov-note">已启用管理口令，请输入后继续。</div>
+          <label>管理口令<input type="password" id="adminPass" class="ipt" autocomplete="current-password"></label>
+          <div class="ov-tip danger hidden" id="adminErr"></div>
+        </div>
+        <div class="ov-actions"><button class="btn primary" id="adminLoginBtn">登录</button></div>
+      </div>
+    </div>
+
+    <!-- ===== 模型查找（旧版 #modelSearchOverlay：前端本地过滤 /core/fees） ===== -->
+    <div class="overlay hidden" id="modelSearchOverlay">
+      <div class="overlay-box wide">
+        <h3>模型查找</h3>
+        <div class="ov-body">
+          <div class="ov-note">跨全部渠道按关键字过滤（模型 ID / 渠道名）；点击行可填入请求示例。</div>
+          <input type="text" id="msInput" class="ipt" placeholder="输入关键字，如 glm / claude / flash" autocomplete="off">
+          <div id="msResult" class="ms-result"></div>
+        </div>
+        <div class="ov-actions"><button class="btn" id="modelSearchClose">关闭</button></div>
+      </div>
+    </div>
+
+    <!-- ===== 账号显示名修改 ===== -->
+    <div class="overlay hidden" id="renameOverlay">
+      <div class="overlay-box narrow">
+        <h3>修改显示名</h3>
+        <div class="ov-body">
+          <div class="ov-note">账号：<span id="rnUid" style="font-family:ui-monospace,monospace"></span></div>
+          <label>显示名<input type="text" id="rnInput" class="ipt" maxlength="60" placeholder="输入新的显示名（1-60 字符）"></label>
+        </div>
+        <div class="ov-actions">
+          <button class="btn" id="btnRenameCancel">取消</button>
+          <button class="btn primary" id="btnRenameSave">保存</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- ===== 通用确认 ===== -->
+    <div class="overlay hidden" id="confirmOverlay">
+      <div class="overlay-box narrow">
+        <h3 id="confirmTitle">确认</h3>
+        <div class="ov-body" id="confirmBody"></div>
+        <div class="ov-actions">
+          <button class="btn" id="confirmCancel">取消</button>
+          <button class="btn primary" id="confirmOk">确定</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- ===== 轻提示 ===== -->
+    <div id="toast" class="toast-wrap"></div>
+
+  </section>
+</div>
+<script src="/app.js"></script>
+</body>
+</html>

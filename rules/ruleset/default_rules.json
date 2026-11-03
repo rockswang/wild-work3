@@ -1,0 +1,74 @@
+{
+  "rules": {
+    "role.developer": {
+      "kind": "jsonpath",
+      "jsonpath": "$.messages[*].role",
+      "regex": "(?i)^\\s*developer\\s*$",
+      "replacement": "system",
+      "order": 10
+    },
+    "sanitize.claude-identity": {
+      "kind": "regex",
+      "regex": "You are Claude Code, Anthropic's official CLI for Claude",
+      "replacement": "You are Claude Code, Anthropic's official CLI tool for Claude",
+      "order": 100
+    },
+    "sanitize.main-branch": {
+      "kind": "regex",
+      "regex": "Main branch \\(you will usually use this for PRs\\)",
+      "replacement": "Default branch (you will usually use this for PRs)",
+      "order": 110
+    },
+    "sanitize.codex-identity": {
+      "kind": "regex",
+      "regex": "You are a coding agent running in the Codex CLI, a terminal-based coding assistant\\.",
+      "replacement": "You are a coding agent running in the Codex CLI tool, a terminal-based coding assistant.",
+      "order": 120
+    },
+    "sanitize.feedback": {
+      "kind": "regex",
+      "regex": "To give feedback, users should report the issue at https://github\\.com/anthropics/claude-code/issues",
+      "replacement": "To provide feedback, users should report the issue at https://github.com/anthropics/claude-code/issues",
+      "order": 130
+    },
+    "sanitize.code-11-128": {
+      "kind": "regex",
+      "regex": "11128",
+      "replacement": "11-128",
+      "order": 140
+    },
+    "sanitize.dsh-identity": {
+      "kind": "regex",
+      "regex": "You are an AI agent powered by DeepSeek Harness",
+      "replacement": "You are an AI agent powered by the DeepSeek Harness",
+      "order": 150
+    },
+    "sanitize.dsh-gui": {
+      "kind": "regex",
+      "regex": "DeepSeek Harness Web GUI",
+      "replacement": "DSH Web GUI",
+      "order": 160
+    },
+    "sanitize.billing-header-value": {
+      "kind": "regex",
+      "regex": "(?i)x-anthropic-billing-header:[^;\\n]*;?\\s*",
+      "replacement": "",
+      "anchor": "x-anthropic-billing-header:",
+      "order": 170
+    },
+    "sanitize.cc-kv": {
+      "kind": "regex",
+      "regex": "(?i)\\bcc_[a-z0-9_]+=[^;\\n]*;?\\s*",
+      "replacement": "",
+      "anchor": "cc_",
+      "order": 180
+    },
+    "sanitize.billing-header-name": {
+      "kind": "regex",
+      "regex": "(?i)x-anthropic-billing-header",
+      "replacement": "x-anthropic-billing-hdr",
+      "anchor": "x-anthropic-billing-header",
+      "order": 190
+    }
+  }
+}
