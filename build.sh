@@ -1,0 +1,82 @@
+#!/usr/bin/env bash
+# wild-work3 主项目独立构建脚本：克隆本仓后 `bash build.sh` 即可产出四个二进制，不依赖任何外部脚本。
+# 产物：本仓 dist/
+#   wild-work3.exe      gateway（对外唯一出口）
+#   ww3-core.exe        core（业务运行时）
+#   custom-api-ext.exe  官方渠道样板
+#   loopguard-hook.exe  官方拦截器样板
+# 用法：bash build.sh [--clean] [--debug] [--zip]
+#   --clean  只清本仓 dist/ 里的产物（不动运行数据目录）
+#   --debug  保留符号表/DWARF 与本机路径，便于本地排障
+#   --zip    给两个官方样板再各打一个插件包 dist/<id>-<version>.zip（包根 = exe + manifest.json）
+set -euo pipefail
+cd "$(dirname "$0")"
+
+OUT="$PWD/dist"
+BUILD_FLAGS=(-trimpath "-ldflags=-s -w")   # -trimpath 见 README：不把本机路径烧进公开产物
+DO_ZIP=0
+
+# 目标表：目标名 = 产物文件名 = 入口包
+TARGETS=("wild-work3.exe:./gateway" "ww3-core.exe:./core" \
+         "custom-api-ext.exe:./custom-api-ext" "loopguard-hook.exe:./loopguard-hook")
+# 需要打插件包的两项（gateway/core 是运行时交付物，不走插件包形状）
+SAMPLES=(custom-api-ext.exe loopguard-hook.exe)
+
+for a in "$@"; do
+  case "$a" in
+    --clean)
+      for f in "$OUT"/*.exe "$OUT"/*.zip "$OUT"/*.sha256 "$OUT"/manifest.json; do
+        if [ -e "$f" ]; then
+          rm -f "$f" 2>/dev/null || echo "[clean] 进程占用，跳过：$(basename "$f")"
+        fi
+      done
+      rm -rf "$OUT/.data" ;;
+    --debug) BUILD_FLAGS=() ;;
+    --zip)   DO_ZIP=1 ;;
+    *) echo "未知参数: $a（可用 --clean / --debug / --zip）" >&2; exit 2 ;;
+  esac
+done
+
+mkdir -p "$OUT"
+echo "[build] wild-work3/main -> dist/  flags=${BUILD_FLAGS[*]:-none}"
+for t in "${TARGETS[@]}"; do
+  exe=${t%%:*}; pkg=${t##*:}
+  go build "${BUILD_FLAGS[@]}" -o "$OUT/$exe" "$pkg"
+done
+
+# manifest 由刚产出的 exe 自己吐：保证包内清单与二进制同源，不在仓里手抄一份版本号
+if [ "$DO_ZIP" = 1 ]; then
+  ZIPPER=$(command -v zip || true)
+  [ -n "$ZIPPER" ] || ZIPPER=$(command -v bsdtar || true)
+  if [ -z "$ZIPPER" ]; then
+    for t in /c/Windows/System32/tar.exe "$SYSTEMROOT/System32/tar.exe"; do
+      [ -f "$t" ] && ZIPPER="$t" && break
+    done
+  fi
+  [ -n "$ZIPPER" ] || { echo "[zip] 找不到 zip / bsdtar / tar.exe，无法打插件包" >&2; exit 1; }
+  for exe in "${SAMPLES[@]}"; do
+    tmp="$OUT/manifest-$exe.json"
+    WW3_DATA="$OUT/.data" "$OUT/$exe" manifest --out "$tmp"   # 临时数据根：否则插件会在 dist/ 落下 logs/
+    id=$(sed -n 's/.*"id":[[:space:]]*"\([^"]*\)".*/\1/p' "$tmp" | head -1)
+    ver=$(sed -n 's/.*"version":[[:space:]]*"\([^"]*\)".*/\1/p' "$tmp" | head -1)
+    [ -n "$id" ] && [ -n "$ver" ] || { echo "[zip] $exe 的 manifest 缺 id/version" >&2; exit 1; }
+    pkgname="$id-$ver.zip"
+    work="$OUT/pkg-$id"
+    rm -rf "$work"; mkdir -p "$work"
+    cp "$OUT/$exe" "$tmp" "$work/"                       # 包根只放 exe + manifest.json（store.Install 逐项比对）
+    mv "$tmp" "$work/manifest.json"
+    rm -f "$OUT/$pkgname"
+    case "$ZIPPER" in
+      */zip) ( cd "$work" && zip -q "../$pkgname" * ) ;;
+      *)     ( cd "$work" && "$ZIPPER" -a -cf "../$pkgname" * ) ;;
+    esac
+    rm -rf "$work"
+    if command -v sha256sum >/dev/null; then
+      ( cd "$OUT" && sha256sum "$pkgname" | tee "$pkgname.sha256" )
+    fi
+    echo "[zip] dist/$pkgname"
+  done
+  rm -rf "$OUT/.data"
+fi
+
+ls -l --block-size=1 "$OUT" | awk 'NR>1 && $NF ~ /\.(exe|zip)$/ {printf "  %-34s %8.2f MB\n", $NF, $5/1048576}'

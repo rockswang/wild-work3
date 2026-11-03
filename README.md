@@ -39,10 +39,19 @@
 | `loopguard-hook/` | 官方拦截器样板：思考链死循环守卫（`hook.stream` 逐帧检测，命中即中断且不伪造 `[DONE]`） |
 | `appconfig/` | 全项目唯一 `config.json`（`gateway` / `core` / `rules` 三段），单写者 + 跨进程锁，坏 JSON fail closed |
 | `rules/` | 规则引擎（`regex` + 受限 `jsonpath`，Anchor 预检）；默认规则表内嵌在 `rules/ruleset/`，权威在 core，Pass A 在 gateway 执行 |
+| `build.sh` | 本仓**独立**构建脚本：克隆即可 `bash build.sh`，不依赖工作区根的批处理（根脚本只是逐个调用各仓自带的它，再把 `.exe` 汇总到根 `dist/`） |
 
 ## 构建
 
-Go 1.26.6。仓库根即 module `wild-work3/main`：
+Go 1.26.6。仓库根即 module `wild-work3/main`，自带独立构建脚本（不依赖任何外部脚本）：
+
+```bash
+bash build.sh          # 产出 dist/{wild-work3,ww3-core,custom-api-ext,loopguard-hook}.exe
+bash build.sh --zip    # 顺带给两个官方样板各打一个插件包 dist/<id>-<version>.zip（包根 = exe + manifest.json）
+bash build.sh --clean  # 只清 dist/ 里的产物，不动运行数据；--debug 保留符号表与本机路径
+```
+
+脚本内部等价于：
 
 ```bash
 go build -trimpath "-ldflags=-s -w" -o dist/wild-work3.exe      ./gateway
