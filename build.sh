@@ -63,12 +63,12 @@ if [ "$DO_ZIP" = 1 ]; then
     pkgname="$id-$ver.zip"
     work="$OUT/pkg-$id"
     rm -rf "$work"; mkdir -p "$work"
-    cp "$OUT/$exe" "$tmp" "$work/"                       # 包根只放 exe + manifest.json（store.Install 逐项比对）
+    cp "$OUT/$exe" "$work/"                              # 包根只放 exe + manifest.json（store.Install 逐项比对）
     mv "$tmp" "$work/manifest.json"
     rm -f "$OUT/$pkgname"
     case "$ZIPPER" in
-      */zip) ( cd "$work" && zip -q "../$pkgname" * ) ;;
-      *)     ( cd "$work" && "$ZIPPER" -a -cf "../$pkgname" * ) ;;
+      */zip) ( cd "$work" && zip -q "../$pkgname" "$exe" manifest.json ) ;;
+      *)     ( cd "$work" && "$ZIPPER" -a -cf "../$pkgname" "$exe" manifest.json ) ;;
     esac
     rm -rf "$work"
     if command -v sha256sum >/dev/null; then
