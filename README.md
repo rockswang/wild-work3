@@ -45,11 +45,15 @@
 Go 1.26.6。仓库根即 module `wild-work3/main`：
 
 ```bash
-go build -o dist/wild-work3.exe      ./gateway
-go build -o dist/ww3-core.exe        ./core
-go build -o dist/custom-api-ext.exe  ./custom-api-ext
-go build -o dist/loopguard-hook.exe  ./loopguard-hook
+go build -trimpath "-ldflags=-s -w" -o dist/wild-work3.exe      ./gateway
+go build -trimpath "-ldflags=-s -w" -o dist/ww3-core.exe        ./core
+go build -trimpath "-ldflags=-s -w" -o dist/custom-api-ext.exe  ./custom-api-ext
+go build -trimpath "-ldflags=-s -w" -o dist/loopguard-hook.exe  ./loopguard-hook
 ```
+
+两个参数都不是可省的：`-s -w` 去符号表与 DWARF（四个二进制 35.9MB → 25.3MB）；`-trimpath` 不把本机绝对路径与 `$GOPATH/pkg/mod` 烧进产物（实测不带时 gateway 里有 36 处项目路径与 31 处模块缓存路径，公开产物会泄露本机目录）。
+
+Go 单文件是静态链接整条依赖闭包，体积与「是不是纯 CLI」无关：带 `net/http` + TLS 的最小 CLI 就 7MB 起，gateway 再叠 systray、core 再叠 `//go:embed` 的 Web UI（104KB）；不依赖 `net/http` 的 `loopguard-hook` 只需 2.8MB——反向印证体积来自依赖图而非业务代码量。
 
 ## 运行
 
