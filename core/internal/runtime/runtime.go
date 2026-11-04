@@ -260,6 +260,10 @@ func (m *Manager) Discover() error {
 			continue
 		}
 		exe := resolveExe(vdir, man.ID, man.Kind)
+		if exe == "" {
+			fmt.Fprintf(os.Stderr, "[runtime] %s/%s: 目录内无可执行文件（约定名 <id>-ext/<id>-hook/裸 id/任意 exe 均未命中），跳过\n", man.ID, ver)
+			continue
+		}
 		// 备好数据根（含旧布局迁移），再注册（W3-39）
 		m.preparePluginData(e.Name(), man.ID)
 		m.Register(&Plugin{Met: man, Exe: exe, Dir: vdir, Source: "official"})
@@ -267,24 +271,68 @@ func (m *Manager) Discover() error {
 	return nil
 }
 
-// resolveExe 定插件可执行文件（W3-25 命名约定）。
+// resolveExe 定插件可执行文件。可执行文件名是**建议性约定**（W3-25），不是强契约：
+// `chatgpt-cli` 这类不按 `-ext`/`-hook` 命名的仓是合法的（用户 m00634 明确），manifest.id 才是身份。
 //
-// 优先按约定：渠道插件 `<id>-ext`，拦截器插件 `<id>-hook`（项目名以 -hook 结尾）。
-// 两者都试是为了兼容早期把 hook 打包成 `-ext` 的插件——目录里实际存在的那个说了算，
-// 因为可执行文件名是打包事实，而 manifest.kind 是能力声明，不保证两者永远同步。
+// 解析顺序：① 约定名 `<id>-ext`/`<id>-hook`（按 kind 定优先级，另一形态作兜底，兼容早期把
+// hook 打包成 `-ext` 的包）→ ② 裸 id 名（如 `chatgpt.exe`）→ ③ 目录扫描兜底：取目录里唯一
+// 的可执行文件（≥2 个时优先带 manifest.id 词干的那个）。全找不到返回空串，由调用方显式跳过，
+// 不再返回编造路径（旧实现会假加载、到调用时才炸，见 AGENTS.md 陷阱 56①）。
 func resolveExe(vdir, id, kind string) string {
-	// 后缀优先级按 manifest.kind：hook → `<id>-hook`，其余 → `<id>-ext`；另一形态作兜底。
 	first, second := "-ext", "-hook"
 	if kind == "hook" {
 		first, second = second, first
 	}
-	names := []string{id + first, id + first + ".exe", id + second, id + second + ".exe"}
+	names := []string{id + first, id + first + ".exe", id + second, id + second + ".exe", id, id + ".exe"}
 	for _, n := range names {
 		if st, err := os.Stat(filepath.Join(vdir, n)); err == nil && !st.IsDir() {
 			return filepath.Join(vdir, n)
 		}
 	}
-	return filepath.Join(vdir, id+first+".exe")
+	// ③ 目录扫描：可执行文件叫什么不做约束，目录里实际存在什么就认什么
+	ents, err := os.ReadDir(vdir)
+	if err != nil {
+		return ""
+	}
+	var cands []string
+	for _, e := range ents {
+		if e.IsDir() || !isExeName(e.Name()) {
+			continue
+		}
+		cands = append(cands, e.Name())
+	}
+	switch len(cands) {
+	case 0:
+		return "" // 没有任何可执行文件：显式失败好过假加载
+	case 1:
+		return filepath.Join(vdir, cands[0])
+	}
+	// 多个候选：优先 id 词干命中（如 id=chatgpt、目录里有 chatgpt.exe 与别的工具），同分取字典序最小（稳定）
+	pick := cands[0]
+	for _, c := range cands[1:] {
+		if strings.HasPrefix(c, id) && !strings.HasPrefix(pick, id) {
+			pick = c
+		}
+		if c < pick {
+			pick = c
+		}
+	}
+	return filepath.Join(vdir, pick)
+}
+
+// isExeName 判定目录项是否像可执行文件（.exe/.bat/.cmd/无后缀；排除文档与数据类已知非二进制）
+func isExeName(name string) bool {
+	low := strings.ToLower(name)
+	switch filepath.Ext(low) {
+	case ".exe", ".bat", ".cmd":
+		return true
+	case ".sh":
+		return true // Unix 脚本形态
+	case "":
+		return !strings.HasSuffix(low, ".md") && low != "license" && low != "notice" // Unix 无后缀二进制形态
+	default:
+		return false // .json/.txt/.zip 等一律不参选
+	}
 }
 
 // semOf 取（懒建）某插件的并发信号量，容量来自 manifest 的 max_workers。
