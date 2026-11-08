@@ -122,8 +122,35 @@ body { background: var(--bg); color: var(--text); font-family: -apple-system,"Se
 .seg-btn { padding: 6px 14px; background: var(--panel2); border: none; color: var(--muted); cursor: pointer; }
 .seg-btn.active { background: var(--primary); color: var(--on-primary); }
 
-/* 通用 grid */
-.acct-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(260px, 1fr)); gap: 12px; }
+/* 旧版账号页：左侧批量操作，右侧六列渠道按钮；渠道色沿用同一套 --ch-* 变量。 */
+.account-actions { align-items: flex-start; }
+.account-actions .pa-left { display: flex; flex-direction: column; align-items: flex-start; gap: 8px; }
+#accountAddButtons { display: grid; grid-template-columns: repeat(6, auto); gap: 8px 10px; min-width: 0; }
+#accountAddButtons .btn { white-space: nowrap; padding: 6px 10px; font-size: 12px; }
+#accountAddButtons .btn.alt { background: var(--ch-custom); border-color: var(--ch-custom); }
+#accountAddButtons .btn.alt.wb { background: var(--ch-wb); border-color: var(--ch-wb); }
+#accountAddButtons .btn.alt.wbai { background: var(--ch-wbai, var(--ch-wb)); border-color: var(--ch-wbai, var(--ch-wb)); }
+#accountAddButtons .btn.alt.qoder { background: var(--ch-qoder); border-color: var(--ch-qoder); }
+#accountAddButtons .btn.alt.qodercn, #accountAddButtons .btn.alt.qodercom { background: var(--ch-qoder); border-color: var(--ch-qoder); }
+#accountAddButtons .btn.alt.trae, #accountAddButtons .btn.alt.traecode { background: var(--ch-trae); border-color: var(--ch-trae); }
+#accountAddButtons .btn.alt.minimax { background: var(--ch-minimax); border-color: var(--ch-minimax); }
+#accountAddButtons .btn.alt:hover { filter: brightness(.88); }
+.acct-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }
+@media (max-width: 1100px) { .account-actions { flex-direction: column; } #accountAddButtons { width: 100%; grid-template-columns: repeat(auto-fit, minmax(116px, 1fr)); } }
+@media (max-width: 640px) { .acct-grid { grid-template-columns: minmax(0, 1fr); } }
+
+/* 自定义模型 Provider 列表（一个插件 N 个实例；W3-44） */
+.cm-list { display: flex; flex-direction: column; gap: 8px; margin-top: 12px; }
+.cm-row { display: flex; align-items: center; gap: 10px; padding: 9px 12px; background: var(--panel2); border: 1px solid var(--border); border-radius: 6px; font-size: 13px; }
+.cm-row .cm-dot { width: 10px; height: 10px; border-radius: 50%; flex: none; }
+.cm-row .cm-main { display: flex; align-items: baseline; gap: 6px; min-width: 130px; }
+.cm-row .cm-id { color: var(--muted); font-family: ui-monospace, Consolas, monospace; font-size: 12px; }
+.cm-row .cm-url { flex: 1; min-width: 0; color: var(--muted); font-family: ui-monospace, Consolas, monospace; font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.cm-row .cm-meta { color: var(--muted); font-size: 12px; flex: none; }
+.cm-row .cm-ops { display: flex; gap: 6px; flex: none; }
+.cm-empty { padding: 14px; text-align: center; color: var(--muted); font-size: 13px; border: 1px dashed var(--border); border-radius: 6px; }
+.cm-idrow { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+.cm-idrow .ipt[disabled] { color: var(--muted); }
 
 /* 账号卡片 */
 .acct-card { background: var(--panel); border: 1px solid var(--border); border-radius: var(--radius); padding: 14px; display: flex; flex-direction: column; gap: 8px; position: relative; }
@@ -156,23 +183,6 @@ body { background: var(--bg); color: var(--text); font-family: -apple-system,"Se
 .credit-summary { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 14px; }
 .cs-item { display: inline-flex; align-items: center; gap: 6px; padding: 6px 10px; background: var(--panel); border: 1px solid var(--border); border-radius: 6px; font-size: 12px; }
 .cs-item .cs-v { font-weight: 600; color: var(--primary); }
-
-/* 渠道卡片网格 */
-.channel-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(240px, 1fr)); gap: 12px; }
-.channel-card { background: var(--panel); border: 1px solid var(--border); border-radius: var(--radius); padding: 14px; display: flex; flex-direction: column; gap: 8px; border-top: 3px solid var(--ch-wb); }
-.channel-card[data-cc="qoder"] { border-top-color: var(--ch-qoder); }
-.channel-card[data-cc="trae"] { border-top-color: var(--ch-trae); }
-.channel-card[data-cc="minimax"] { border-top-color: var(--ch-minimax); }
-.channel-card[data-cc="custom"] { border-top-color: var(--ch-custom); }
-.channel-card[data-cc="hook"] { border-top-color: var(--ch-hook); }
-.channel-card .ch-title { display: flex; align-items: center; gap: 8px; font-weight: 600; }
-.channel-card .ch-avatar { width: 28px; height: 28px; border-radius: 6px; display: flex; align-items: center; justify-content: center; color: #fff; font-size: 12px; font-weight: 600; }
-.channel-card .ch-meta { font-size: 12px; color: var(--muted); }
-.channel-card .chip { display: inline-flex; padding: 2px 8px; border-radius: 10px; font-size: 11px; background: var(--panel2); border: 1px solid var(--border); }
-.channel-card .chip.hook { color: var(--ch-hook); border-color: var(--ch-hook); }
-.channel-card .chip.cooling { color: var(--warn); border-color: var(--warn); }
-.channel-card .ch-actions { display: flex; gap: 6px; margin-top: auto; flex-wrap: wrap; }
-.channel-card .ch-caps { display: flex; gap: 4px; flex-wrap: wrap; font-size: 11px; color: var(--muted); }
 
 /* 用量卡片 */
 .usage-cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 12px; margin-bottom: 16px; }
@@ -235,6 +245,11 @@ body { background: var(--bg); color: var(--text); font-family: -apple-system,"Se
 .ov-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 18px; }
 .ipt, select.ipt, textarea.ipt, .ov-body input[type="text"], .ov-body input[type="number"], .ov-body input[type="password"], .ov-body input[type="time"], .ov-body textarea, .ov-body select { padding: 8px 10px; background: var(--panel2); border: 1px solid var(--border); border-radius: 6px; color: var(--text); font-size: 13px; width: 100%; }
 .ov-body textarea.ipt { font-family: ui-monospace, Consolas, monospace; resize: vertical; line-height: 1.5; }
+/* 密钥字段旁的「显示密钥」按钮（W3-45）：输入框占满剩余宽度，按钮不换行 */
+.ipt-row { display: flex; align-items: center; gap: 6px; }
+.ipt-row .ipt { flex: 1 1 auto; min-width: 0; }
+.ipt-row .btn { flex: 0 0 auto; white-space: nowrap; }
+.ipt-row .btn[disabled] { opacity: .6; }
 .ov-body input:focus, .ov-body select:focus, .ov-body textarea:focus { outline: none; border-color: var(--primary); }
 .ov-note { font-size: 12px; color: var(--muted); line-height: 1.6; }
 .ov-info { background: var(--panel2); border: 1px solid var(--border); border-radius: 6px; padding: 10px; font-size: 13px; line-height: 1.7; }

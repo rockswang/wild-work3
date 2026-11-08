@@ -76,6 +76,31 @@ if [ "$DO_ZIP" = 1 ]; then
     fi
     echo "[zip] dist/$pkgname"
   done
+
+  # main.zip = core + 两个官方样板（W3-48 §3.2：gateway 不在包内，它不自动更新）
+  # 安装器按 `<exe 词干>.manifest.json` 配对，故样板清单必须改名为 <stem>.manifest.json
+  cver=$("$OUT/ww3-core.exe" --version 2>/dev/null | sed -n 's/^ww3-core \([0-9][0-9.]*\).*/\1/p' | head -1)
+  [ -n "$cver" ] || { echo "[zip] 读不出 ww3-core 版本号" >&2; exit 1; }
+  work="$OUT/pkg-main"
+  rm -rf "$work"; mkdir -p "$work"
+  cp "$OUT/ww3-core.exe" "$work/"
+  for exe in "${SAMPLES[@]}"; do
+    stem="${exe%.exe}"
+    WW3_DATA="$OUT/.data" "$OUT/$exe" manifest --out "$work/$stem.manifest.json"
+    cp "$OUT/$exe" "$work/"
+  done
+  rm -rf "$OUT/.data"
+  pkgname="main-$cver.zip"
+  rm -f "$OUT/$pkgname"
+  case "$ZIPPER" in
+    */zip) ( cd "$work" && zip -q "../$pkgname" ./* ) ;;
+    *)     ( cd "$work" && "$ZIPPER" -a -cf "../$pkgname" ./* ) ;;
+  esac
+  rm -rf "$work"
+  if command -v sha256sum >/dev/null; then
+    ( cd "$OUT" && sha256sum "$pkgname" | tee "$pkgname.sha256" )
+  fi
+  echo "[zip] dist/$pkgname（core + ${SAMPLES[*]}）"
   rm -rf "$OUT/.data"
 fi
 

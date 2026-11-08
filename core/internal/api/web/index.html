@@ -53,7 +53,6 @@
   <section class="panel">
     <div class="main-tabs">
       <button class="mtab active" data-mtab="accounts">账号管理</button>
-      <button class="mtab" data-mtab="channels">渠道管理</button>
       <button class="mtab" data-mtab="usage">用量与流水</button>
       <button class="mtab" data-mtab="stats">运行统计</button>
       <button class="mtab" data-mtab="fees">模型和费率</button>
@@ -62,7 +61,7 @@
 
     <!-- ===== Tab: 账号管理 ===== -->
     <div class="mtab-body" id="mtabAccounts">
-      <div class="panel-head">
+      <div class="panel-head account-actions">
         <div class="pa-group pa-left">
           <button class="btn primary" id="btnRefreshAll">刷新积分</button>
           <button class="btn" id="btnCheckinAll">全部签到</button>
@@ -72,21 +71,11 @@
           </label>
         </div>
         <div class="pa-spacer"></div>
+        <div class="pa-right" id="accountAddButtons" aria-label="添加渠道账号"></div>
       </div>
       <div id="creditSummary" class="credit-summary hidden"></div>
       <div id="acctList" class="acct-grid"></div>
-      <div id="acctEmpty" class="empty hidden">还没有账号，点击「＋ 添加渠道」添加</div>
-    </div>
-
-    <!-- ===== Tab: 渠道管理 ===== -->
-    <div class="mtab-body hidden" id="mtabChannels">
-      <div class="panel-head">
-        <div class="pa-group pa-left">
-          <button class="btn primary" id="btnAddChannel">＋ 添加渠道</button>
-          <div class="seg" id="chInfo"></div>
-        </div>
-      </div>
-      <div id="channelGrid" class="channel-grid"></div>
+      <div id="acctEmpty" class="empty hidden">还没有账号，点击上方渠道按钮添加</div>
     </div>
 
     <!-- ===== Tab: 用量与流水 ===== -->
@@ -118,12 +107,16 @@
 
     <!-- ===== Tab: 运行统计 ===== -->
     <div class="mtab-body hidden" id="mtabStats">
+      <div class="panel-head"><div class="pa-group">
+        <button class="btn small" id="btnRefreshStats">刷新</button>
+      </div></div>
       <div class="stats-cards" id="statsCards"></div>
       <div id="statsChart"></div>
       <div id="statsChannels"></div>
       <div id="statsModels"></div>
       <div id="statsFallbacks"></div>
       <div id="statsReqs"></div>
+      <div id="statsFails"></div>
       <div id="statsAbnormal"></div>
       <div id="warnings" class="warnings"></div>
       <div class="panel-head"><h3>运行日志</h3></div>
@@ -222,15 +215,50 @@
       </div>
     </div>
 
-    <!-- ===== 添加渠道 wizard overlay ===== -->
+    <!-- ===== 单实例渠道配置表单（插件自带渠道，由 config.schema 生成） ===== -->
     <div class="overlay hidden" id="channelWizard">
       <div class="overlay-box wide">
-        <h3 id="cwTitle">添加渠道</h3>
+        <h3 id="cwTitle">配置渠道</h3>
         <div class="ov-body" id="cwBody"></div>
         <div class="ov-actions">
-          <button class="btn" id="cwPrev" hidden>上一步</button>
           <button class="btn" id="cwCancel">取消</button>
-          <button class="btn primary" id="cwNext">下一步</button>
+          <button class="btn primary" id="cwNext">保存</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- ===== 自定义模型 Provider 列表（旧版 customModelsOverlay 的同位替身：一个插件 N 个实例，W3-44） ===== -->
+    <div class="overlay hidden" id="customModelsOverlay">
+      <div class="overlay-box wide">
+        <h3 id="cmTitle">自定义模型</h3>
+        <div class="ov-note">
+          客户端用 <b>渠道标识/模型名</b> 访问（如 <code>stepfun/gpt-4o-mini</code>），用量与统计全线统一。
+          渠道标识不得与内建渠道同名（如 workbuddy / cline / oczen）。
+        </div>
+        <div class="cm-list" id="cmList"></div>
+        <div class="ov-actions">
+          <button class="btn primary" id="cmAdd">＋ 新增 Provider</button>
+          <button class="btn" id="cmClose">关闭</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- ===== Provider 编辑器（先测后存；测试通过时顺手导入模型清单） ===== -->
+    <div class="overlay hidden" id="providerEditor">
+      <div class="overlay-box wide">
+        <h3 id="peTitle">新增 Provider</h3>
+        <div class="ov-body">
+          <div class="cm-idrow">
+            <label class="frow">渠道标识 *<input class="ipt" id="peID" placeholder="如 stepfun" autocomplete="off"></label>
+            <label class="frow">展示名<input class="ipt" id="peName" placeholder="缺省同渠道标识" autocomplete="off"></label>
+          </div>
+          <div class="ov-body" id="peSchema"></div>
+          <div class="ov-note" id="peMsg">建议先「测试连接」：连通后会自动导入上游模型清单。</div>
+        </div>
+        <div class="ov-actions">
+          <button class="btn" id="peCancel">取消</button>
+          <button class="btn" id="peTest">测试连接</button>
+          <button class="btn primary" id="peSave">保存</button>
         </div>
       </div>
     </div>

@@ -74,14 +74,15 @@ wild-work3.exe serve --data ./data         # 数据目录（默认 = exe 同目�
 
 打开 <http://127.0.0.1:7863> 即 Web 面板。只监听 127.0.0.1 并做 Host 校验（防 DNS rebinding）；core 默认 `127.0.0.1:7864`，由 gateway 下发 `--listen`，不对外暴露。
 
-分发与更新（gateway 段配置，或同名 CLI 开关）：
+分发与更新（gateway 段配置，或同名 CLI 开关；W3-48）：
 
 | 键 / 开关 | 缺省 |
 |---|---|
-| `--registry` | `wild-work3/ww3-registry`（官方插件清单，取 `releases/latest/download/index.json`） |
-| `--main-repo` | `wild-work3/wild-work3`（core 自动更新清单 `update.json`） |
-| `--proxy` | `https://gh-proxy.com/`、`https://ghfast.top/`（与直连并发竞速） |
-| `--pubkey` | 空（ed25519 hex；未配则面板标「清单未验签」，正式发版前必须内置） |
+| `--registry` | `wild-work3/ww3-ext-registry`（官方插件市场仓：根目录平铺 `<id>.json`，整仓 tarball 一次拉取） |
+| `--registry-ref` | `main`（拉取分支/tag/commit；锁版本时写 tag/sha） |
+| `--proxy` | `https://gh-proxy.com/`、`https://ghfast.top/`（与直连**并发竞速**，直连不作依赖） |
+
+主程序分两个包发布：**`wild-work3.exe`（gateway）单独发布且不自动更新**（只在 `/gw/updates` 展示版本 + `sha256` + 手动替换指引）；**`main.zip` = `ww3-core.exe` + `custom-api-ext.exe` + `loopguard-hook.exe`**，走与插件相同的自动更新机制。第三方插件不走商店：下载符合契约的包，解到 `<plugins>/<id>/<ver>/` 并写 `current`（裸版本号无换行）即可手动安装。
 
 ## 命令行自测
 

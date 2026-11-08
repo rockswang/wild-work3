@@ -63,9 +63,13 @@ type HookEvent struct {
 	Data json.RawMessage
 }
 
-// HookUpstream 上游执行结果摘要，随 hook.stream 的 params 下发。
+// HookUpstream 上游执行结果摘要，随 **`upstream.end` 帧**下发（不随 params）。
 //
-// why：上游本身失败时 hook 需要知道「这不是我该管的事」——例如守卫不该在空流上误报，
+// why：链是流水线，hook 进程在上游还没出第一帧就已经 spawn 了，此时根本不存在“上游结果”；
+// 旧实现把它塞进 params，只能填个假值（且因为 RunHooks 跑在渠道结束之后，“流水线”名存实亡）。
+// 权威的成败与错因一律以 `upstream.end` 的 `{ok,kind?,message?}` 为准。
+//
+// 另一层语义不变：上游本身失败时 hook 需要知道“这不是我该管的事”——例如守卫不该在空流上误报，
 // 也不该把自己的命中覆盖成上游错误。
 type HookUpstream struct {
 	OK      bool   `json:"ok"`
@@ -73,13 +77,14 @@ type HookUpstream struct {
 	Message string `json:"message,omitempty"`
 }
 
-// hookParams 是 hook.stream 的 params。
+// hookParams 是 hook.stream 的 params（invoke 时一次性下发）。
+//
+// 注意：**不含上游结果摘要**——spawn 时上游还没开始跑，成败只经 `upstream.end` 帧传达（见 HookUpstream）。
 type hookParams struct {
-	Request  *chat.GenerateRequest `json:"request,omitempty"` // 本次对话请求（hook 可能据 model/messages 决策）
-	Config   map[string]any        `json:"config,omitempty"`  // 该实例配置
-	HookID   string                `json:"hook_id,omitempty"` // 实例 ID
-	Chain    hookChain             `json:"chain"`             // 链位置
-	Upstream *HookUpstream         `json:"upstream,omitempty"`
+	Request *chat.GenerateRequest `json:"request,omitempty"` // 本次对话请求（hook 可能据 model/messages 决策）
+	Config  map[string]any        `json:"config,omitempty"`  // 该实例配置
+	HookID  string                `json:"hook_id,omitempty"` // 实例 ID
+	Chain   hookChain             `json:"chain"`             // 链位置
 }
 
 // hookChain 链位置（Index 从 0 开始，0 = 最靠近下游、最先看到请求的层）。
@@ -116,6 +121,11 @@ type HookChain struct {
 //
 // src 由上游生产（core 在 channel 事件回调里塞入），emit 写往下游（IPC 事件写入器）。
 // 返回错误表示链上某层失败，调用方应把该错误作为终止事件发给下游，而不要补正常收尾。
+//
+// **调用时序是契约的一部分**：调用方必须在发起渠道调用**之前**就把本方法跑起来（goroutine），
+// 让它与渠道 worker 并行。若等渠道跑完再调（旧实现），本方法内部的流水线就退化成「先收集再回放」：
+// 首字延迟 = 整段生成时长，且 src 缓冲一满就把反压一路堵回上游（实测 401 帧的响应直接停摆到超时）。
+// `upstream` 由调用方在 close(src) 之前填写，本方法只在 range 退出之后读它（靠 close 构成 happens-before）。
 func (m *Manager) RunHooks(
 	ctx context.Context,
 	hooks []HookSpec,
@@ -157,7 +167,7 @@ func (m *Manager) RunHooks(
 		if i > 0 {
 			target = in[i-1]
 		}
-		params := hookParams{Request: req, Config: h.Config, HookID: h.ID, Upstream: upstream}
+		params := hookParams{Request: req, Config: h.Config, HookID: h.ID}
 		params.Chain = hookChain{Index: i, Total: n}
 		cb := &rpc.Callback{OnEvent: func(msg *jsonl.Msg) error {
 			return target.push(msg.Event, msg.Data)
@@ -180,6 +190,12 @@ func (m *Manager) RunHooks(
 	inj := in[n-1]
 	for e := range src {
 		if err := inj.push(e.Name, e.Data); err != nil {
+			// “写不进去”几乎总是因为某层已经带着错误退出（进程死了，stdin 自然断开），
+			// 真正的原因在它的 result 里而不在传输层。先把链收干净拿带 kind 的错误，
+			// 否则下游只能看到 “closed” 这类无意义消息，route 也无法按 errkind 分类（W3-25）。
+			if real := m.waitChain(calls, hooks); real != nil {
+				return real
+			}
 			return fmt.Errorf("拦截器链拒绝事件 %s: %w", e.Name, err)
 		}
 	}
@@ -188,23 +204,37 @@ func (m *Manager) RunHooks(
 		end["kind"], end["message"] = upstream.Kind, upstream.Message
 	}
 	if err := inj.push("upstream.end", mustRawJSON(end)); err != nil {
+		if real := m.waitChain(calls, hooks); real != nil {
+			return real
+		}
 		return fmt.Errorf("拦截器链拒绝结束帧: %w", err)
 	}
 
 	// 收尾：从链尾往链头等结果（数据流方向的反向），错误优先归因到最靠近上游那层。
-	for i := n - 1; i >= 0; i-- {
+	return m.waitChain(calls, hooks)
+}
+
+// waitChain 逐层等拦截器进程收尾，返回第一个不允 fail-open 的失败（链尾优先）。
+//
+// 两处复用：正常收尾与“注入被拒”后的归因。后者必须等：拒绝只是后果，带 kind 的 result 才是原因。
+func (m *Manager) waitChain(calls []*plugin.Call, hooks []HookSpec) error {
+	var first error
+	for i := len(calls) - 1; i >= 0; i-- {
 		c := calls[i]
 		if c == nil {
-			continue
+			continue // fail-open 且启动失败的层：已退化成直通，无进程可等
 		}
 		if _, err := c.Wait(); err != nil {
 			if !hooks[i].FailOpen {
-				return fmt.Errorf("拦截器 %s 处理失败: %w", hooks[i].ID, err)
+				if first == nil {
+					first = fmt.Errorf("拦截器 %s 处理失败: %w", hooks[i].ID, err)
+				}
+				continue
 			}
 			m.logf("拦截器 %s 收尾报错，已忽略: %v", hooks[i].ID, err)
 		}
 	}
-	return nil
+	return first
 }
 
 // startHook 启动 hook 进程并发起 hook.stream 双向流调用。

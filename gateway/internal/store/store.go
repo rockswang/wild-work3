@@ -21,17 +21,19 @@ import (
 	"wild-work3/main/gateway/internal/registry"
 )
 
-// 清单类型统一用 registry.PluginEntry / registry.AssetEntry（W3-38）：
+// 清单类型统一用 registry.PluginEntry / registry.VersionEntry（W3-48 v2）：
 // 旧的 store.CatalogEntry/VersionEntry 已删，避免出现两份形状不同的清单模型。
 
 // Deps 一次安装所需的分发参数。
 type Deps struct {
-	Proxies     []string          // 下载代理前缀（registry_repo 同款）
+	Proxies     []string          // 下载代理前缀（与直连并发竞速）
 	AllowHosts  map[string]bool   // host allowlist；空表=不限制（仅本地测试/手工装包）
 	ProtocolVer int               // 当前 IPC 协议版本（版本门用）
 	GatewayVer  string            // 当前 gateway 版本（版本门用）
 	Opt         registry.Options  // 竞速判据
 	OnProgress  registry.Progress // 可为 nil
+	// Locator 发布包定位器（注册文件只给 repo + version，包地址由发布页解析，§4.2）
+	Locator *registry.Locator
 }
 
 // Installed 已安装插件状态。
@@ -78,6 +80,10 @@ func (m *Manager) List() ([]Installed, error) {
 		if b, err := os.ReadFile(filepath.Join(idDir, "current")); err == nil {
 			inst.Current = strings.TrimSpace(string(b))
 		}
+		// 没有 current 的目录不是已装插件（卸载残留的旧布局空壳/半途失败的临时目录）。
+		if inst.Current == "" {
+			continue
+		}
 		if b, err := os.ReadFile(filepath.Join(idDir, "previous")); err == nil {
 			inst.Previous = strings.TrimSpace(string(b))
 		}
@@ -116,24 +122,31 @@ func (m *Manager) List() ([]Installed, error) {
 	return out, nil
 }
 
-// Install 从 registry 条目下载 zip 包并安装到 <id>/<version>/，成功后原子切换 current。
+// Install 按注册文件定位并下载 zip 包，安装到 <id>/<version>/，成功后原子切换 current。
 //
-// 三道硬门（W3-38，缺一个就拒装，不做「装了再说」）：
-//  1. 版本门：registry.CheckGate（protocol{min,max} + gateway{min,max}）——此前全仓无一处校验协议区间；
-//  2. sha256 必填：旧写法 `if ver.SHA256 != ""` 会让清单少写字段时静默跳过校验；
-//  3. host allowlist：清单被往绝对 URL 塞外部主机时直接不参与竞速。
+// 三道硬门（缺一个就拒装，不做「装了再说」）：
+//  1. 版本门：registry.CheckGate（protocol{min,max} + gateway{min,max}）；
+//  2. sha256 必填：下载后强制校验包体摘要（注册表仓不验证，客户端验，§9.3）；
+//  3. host allowlist：定位出的下载 URL 主机不在白名单就不参与竞速。
 //
 // 返回命中的源 URL（面板要显示「包从哪拿的」）。
-func (m *Manager) Install(p registry.PluginEntry, ver registry.AssetEntry, d Deps) (string, error) {
+func (m *Manager) Install(p registry.PluginEntry, ver registry.VersionEntry, d Deps) (string, error) {
 	if ver.Version == "" {
-		return "", fmt.Errorf("清单条目缺 version")
+		return "", fmt.Errorf("注册文件缺 version")
 	}
 	if err := registry.CheckGate(p, ver, d.ProtocolVer, d.GatewayVer); err != nil {
 		return "", err
 	}
-	urls := allow(p.PackageSources(ver, d.Proxies), d.AllowHosts)
+	if d.Locator == nil {
+		return "", fmt.Errorf("未配置发布包定位器")
+	}
+	urls, err := d.Locator.URLs(context.Background(), p.Repo, ver)
+	if err != nil {
+		return "", err
+	}
+	urls = allow(urls, d.AllowHosts)
 	if len(urls) == 0 {
-		return "", fmt.Errorf("清单条目 %s %s 没有可用源（主机均不在允许列表内）", p.ID, ver.Version)
+		return "", fmt.Errorf("注册条目 %s %s 没有可用源（主机均不在允许列表内）", p.ID, ver.Version)
 	}
 	tmpDir := filepath.Join(m.root, ".tmp-"+p.ID)
 	_ = os.RemoveAll(tmpDir)
@@ -167,8 +180,8 @@ func (m *Manager) Install(p registry.PluginEntry, ver registry.AssetEntry, d Dep
 	if man.ID != "" && man.ID != p.ID {
 		return "", fmt.Errorf("manifest id 不匹配: 期望 %s 实际 %s", p.ID, man.ID)
 	}
-	if man.Kind != "" && p.Kind != "" && man.Kind != p.Kind {
-		return "", fmt.Errorf("manifest kind 不匹配: 清单说 %s 包内是 %s", p.Kind, man.Kind)
+	if man.Kind != "" && p.Type != "" && man.Kind != p.Type {
+		return "", fmt.Errorf("manifest kind 不匹配: 清单说 %s 包内是 %s", p.Type, man.Kind)
 	}
 	if man.Version != "" && man.Version != ver.Version {
 		return "", fmt.Errorf("manifest version 与清单不符: 清单 %s 包内 %s", ver.Version, man.Version)
@@ -182,6 +195,65 @@ func (m *Manager) Install(p registry.PluginEntry, ver registry.AssetEntry, d Dep
 		return "", err
 	}
 	return src, m.switchTo(p.ID, ver.Version, true)
+}
+
+// InstallBundle 从已解包的目录装一个官方样板（main.zip 里 `custom-api-ext.exe` + `custom-api-ext.manifest.json`）。
+//
+// 与 Install 的差别：不下载（字节已在本地）、不校验 sha256（由外层 main.zip 的摘要背书）、
+// 但**仍然校验 manifest 的 id/kind/version 自洽**——装错文件是最难查的一类事故。
+// 同版本已存在时直接切 current，不重写目录（幂等，避免每次 apply 都动文件时间）。
+func (m *Manager) InstallBundle(exePath, manifestPath string) error {
+	mb, err := os.ReadFile(manifestPath)
+	if err != nil {
+		return fmt.Errorf("读 %s 失败: %w", filepath.Base(manifestPath), err)
+	}
+	var man struct {
+		ID      string `json:"id"`
+		Kind    string `json:"kind"`
+		Version string `json:"version"`
+	}
+	if err := json.Unmarshal(mb, &man); err != nil {
+		return fmt.Errorf("manifest 解析失败（%s）: %w", filepath.Base(manifestPath), err)
+	}
+	if man.ID == "" || man.Version == "" {
+		return fmt.Errorf("manifest 缺 id/version（%s）", filepath.Base(manifestPath))
+	}
+	if man.Kind != "channel" && man.Kind != "hook" {
+		return fmt.Errorf("manifest kind 非法: %q（只接受 channel/hook）", man.Kind)
+	}
+	dest := filepath.Join(m.root, man.ID, man.Version)
+	if _, err := os.Stat(filepath.Join(dest, "manifest.json")); err != nil {
+		// 目录不存在（或半成品）：整目录重建，避免旧残留混进新版本
+		_ = os.RemoveAll(dest)
+		if err := os.MkdirAll(dest, 0o755); err != nil {
+			return err
+		}
+		if err := copyFile(exePath, filepath.Join(dest, filepath.Base(exePath))); err != nil {
+			return fmt.Errorf("拷贝 %s 失败: %w", filepath.Base(exePath), err)
+		}
+		if err := os.WriteFile(filepath.Join(dest, "manifest.json"), mb, 0o644); err != nil {
+			return err
+		}
+	}
+	return m.switchTo(man.ID, man.Version, true)
+}
+
+// copyFile 拷贝文件并保留可执行权限（Windows 上 0755 无实际含义，非 Windows 必须）。
+func copyFile(src, dst string) error {
+	in, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer in.Close()
+	out, err := os.OpenFile(dst, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o755)
+	if err != nil {
+		return err
+	}
+	if _, err := io.Copy(out, in); err != nil {
+		_ = out.Close()
+		return err
+	}
+	return out.Close()
 }
 
 // allow 按 host allowlist 过滤候选源（空表视为不限制）。
@@ -249,12 +321,9 @@ func (m *Manager) Rollback(id string) (string, error) {
 // exe + manifest + 版本目录，整目录删掉即等于「只退软件」。但现网与 dist 里仍有旧布局
 // （可变量混在安装根 `<plugins>/<id>/`）的残留，删之前必须跳过 auths/logs/stat 三个契约目录，
 // 否则「卸载→重装」会把用户所有账号打回未登录。
-// `purge=true` 才连（旧布局遗留的）数据一起删——面板上用户显式勾选「连凭据一起删」时用。
+// 旧布局中的 auths/logs/stat 仍须保留：卸载只删除安装内容，不提供破坏数据的 purge 模式。
 func (m *Manager) Uninstall(id string, purge bool) error {
 	dir := filepath.Join(m.root, id)
-	if purge {
-		return os.RemoveAll(dir)
-	}
 	ents, err := os.ReadDir(dir)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -271,6 +340,11 @@ func (m *Manager) Uninstall(id string, purge bool) error {
 			firstErr = err
 		}
 	}
+	// 内容清完后把目录本身也删掉：否则 List() 仍会把这个空壳列为「已安装」（current 为空），
+	// 面板上刚卸载的插件不消失。旧布局因保留了 auths/logs/stat 而目录非空，Remove 会失败，正好留下。
+	if firstErr == nil {
+		_ = os.Remove(dir)
+	}
 	return firstErr
 }
 
@@ -279,7 +353,7 @@ func (m *Manager) Uninstall(id string, purge bool) error {
 // 也不能把凭据跟着二进制一起删了。
 var keepOnUninstall = map[string]bool{"auths": true, "logs": true, "stat": true}
 
-// FetchCatalog 已删（W3-38）：清单拉取与验签归 registry.LoadIndex，
+// FetchCatalog 已删（W3-38）：清单拉取归 registry.Load，
 // 本包只管文件系统上的安装/切换/回滚，不再自持一份无签名的清单形状。
 
 func sha256File(p string) (string, error) {

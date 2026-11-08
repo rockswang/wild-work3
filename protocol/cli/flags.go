@@ -5,7 +5,7 @@
 //	custom-api-ext.exe models --base-url https://... --api-key sk-...
 //	custom-api-ext.exe call --data D:/plugins/custom-api
 //
-// 两条硬约定（见 docs/PLUGIN_CLI.md）：
+// 两条硬约定（见 protocol/docs/PLUGIN_CLI.md）：
 //  1. 第一个位置参数是**裸命令名**（不带减号），不是 `-mode xxx`；
 //  2. 开关一律写双短横线 `--data`，不提供单短横线简写——这些参数只由 core 与
 //     脚本传，不面向人类手打。

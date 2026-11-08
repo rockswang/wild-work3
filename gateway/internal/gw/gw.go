@@ -1,11 +1,15 @@
 // Package gw 实现 gateway 管理面 HTTP API（/gw/*）：版本、插件商店/安装/升级/回滚/卸载、更新、退出。
 //
-// 返回结构以 gateway/web/app.js 为权威契约：
+// 返回结构以 core 的 Web UI（app.js）为权威契约（W3-17）：
 //
-//	GET /gw/version      → {gateway, core, protocol, ok}
-//	GET /gw/plugins      → 裸数组 [{plugin_id,name,version,latest,kind,...}]
-//	GET /gw/plugins/store→ 裸数组（同上 + installed/source/author/description）
-//	GET /gw/updates      → {gateway:{current,latest,update}, core:{current,latest,update,changelog}}
+//	GET /gw/version        → {gateway, core, protocol, ok}
+//	GET /gw/plugins        → 裸数组 [{plugin_id,name,version,latest,kind,...}]
+//	GET /gw/plugins/store  → 裸数组（注册表条目 + installed/version/latest/versions）
+//	GET /gw/plugins/store/errors → 裸数组 [{file,reason}]
+//	GET /gw/updates        → {gateway:{current,latest,update:false,manual:true}, main:{...}, job, catalog}
+//
+// W3-48 v2：注册表 = 平铺注册文件（不签名、不托管二进制、不约定 tag），
+// 包由发布页定位（tags.atom → expanded_assets），下载走多源竞速 + sha256 强制校验。
 package gw
 
 import (
@@ -14,7 +18,6 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"runtime"
 	"strings"
 	"sync"
 	"time"
@@ -26,7 +29,7 @@ import (
 // Server gateway 管理面。
 type Server struct {
 	Store *store.Manager
-	// Dist 分发配置（W3-38：registry 独立仓 + 单一信任根 + 多源竞速）。
+	// Dist 分发配置（注册表仓 + 代理 + 竞速判据）。
 	Dist    Dist
 	Version map[string]string
 	// CoreVersionFn 拉取 core 版本（可为 nil）
@@ -40,16 +43,15 @@ type Server struct {
 	HaltCore func() error
 	// StartCore 替换后重新拉起 core，可为 nil
 	StartCore func()
-	// UpdateDir 更新包目录（downloaded 的 core 更新包）
+	// UpdateDir 更新包目录（downloaded 的 main.zip）
 	UpdateDir string
 	// GatewayExe 自身可执行路径（仅用于「手动升级」提示里写清要换哪个文件，W3-38）
 	GatewayExe string
 
-	cache *registry.Cache // index.json 按来源缓存
+	cache *registry.Cache // 注册表快照按来源缓存
 
 	mu      sync.Mutex
-	update2 *updateJob // core 更新任务状态（idle/downloading/ready/failed/applied/rolled_back）
-	main_   *mainSlot  // update.json 拉取结果（TTL）
+	update2 *updateJob // main.zip 更新任务状态（idle/downloading/ready/failed/applied/rolled_back）
 }
 
 // Routes 注册 /gw/* 路由。
@@ -60,15 +62,34 @@ func (s *Server) Routes(mux *http.ServeMux) {
 	mux.HandleFunc("/gw/version", s.version)
 	mux.HandleFunc("/gw/plugins", s.plugins)
 	mux.HandleFunc("/gw/plugins/store", s.storeList)
+	mux.HandleFunc("/gw/plugins/store/errors", s.storeErrors)
 	mux.HandleFunc("/gw/plugins/", s.pluginOne)
 	mux.HandleFunc("/gw/updates", s.updates)
 	mux.HandleFunc("/gw/updates/status", s.updateStatus)
 	mux.HandleFunc("/gw/updates/download", s.updateDownload)
 	mux.HandleFunc("/gw/updates/apply", s.updateApply)
 	mux.HandleFunc("/gw/updates/rollback", s.updateRollback)
-	// 清单刷新：面板上的「重新拉清单」按钮（缓存 TTL 未到也能强制重拉，装新插件后不用等）
+	// 注册表刷新：面板「重新拉清单」按钮（TTL 未到也能强制重拉）
 	mux.HandleFunc("/gw/registry/refresh", s.registryRefresh)
 	mux.HandleFunc("/gw/shutdown", s.shutdown)
+}
+
+// DrainBody 保证请求体被读完（包在最外层，覆盖 /gw/*、/core/* 与 gateway 自己的登录/配置端点）。
+//
+// 起因：handler 不读 body 时（`/gw/registry/refresh` 完全不看参数，但前端仍会 `POST {}`），
+// net/http 发现请求体未消费完，就在回完响应后直接关连接；客户端表现为
+// `ConnectionResetError: [WinError 10054] 远程主机强迫关闭了一个现有的连接`——
+// 实测连发 8 次挂 5~6 次。`curl` 不复用连接所以看不出来，容易误判成前端 bug。
+//
+// 用「handler 返回后再丢弃剩余」而不是「事先读进内存」：后者会把大请求体（/v1 可到 30MiB）
+// 整个缓冲一遍，且 1MiB 上限会截断正常请求。
+func DrainBody(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		next.ServeHTTP(w, r)
+		if r.Body != nil {
+			_, _ = io.Copy(io.Discard, io.LimitReader(r.Body, 1<<20))
+		}
+	})
 }
 
 func (s *Server) version(w http.ResponseWriter, r *http.Request) {
@@ -81,22 +102,20 @@ func (s *Server) version(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, out)
 }
 
-// plugins：GET 已安装列表（裸数组）。
+// plugins：GET 已安装列表（裸数组）。latest 只读缓存（Peek 不发网络）。
 func (s *Server) plugins(w http.ResponseWriter, r *http.Request) {
 	list, err := s.Store.List()
 	if err != nil {
 		writeErr(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	// latest 从清单缓存里抹（Peek 不发网络请求：商店列表页才会拉，这里只能用已缓存的）；
-	// 没缓存就退化成「当前版本即最新」，不故弄出可升级红点。
-	ix, _ := s.cache.Peek(s.Dist.Registry)
+	snap, _ := s.cache.Peek(s.Dist.Registry)
 	out := make([]map[string]any, 0, len(list))
 	for _, p := range list {
 		v := installedView(p)
-		if ix != nil {
-			if c, ok := ix.PluginByID(p.ID); ok {
-				if lat, ok2 := pickVersion(c.Versions, ""); ok2 {
+		if snap != nil {
+			if c, ok := snap.PluginByID(p.ID); ok {
+				if lat, ok2 := c.Pick(""); ok2 {
 					v["latest"] = lat.Version
 					v["status"] = orDefault(c.Status, "unverified")
 				}
@@ -119,7 +138,7 @@ func installedView(p store.Installed) map[string]any {
 }
 
 // pluginOne：/{id}、/{id}/activate、/{id}/rollback、/{id}/uninstall、/{id}/upgrade。
-// 另兼容 POST /gw/plugins/install|upgrade|rollback|uninstall（body 带 plugin_id）。
+// 另兼容 POST /gw/plugins/install|upgrade|rollback|uninstall（body 带 plugin_id，动作在路径里）。
 func (s *Server) pluginOne(w http.ResponseWriter, r *http.Request) {
 	rest := strings.TrimPrefix(r.URL.Path, "/gw/plugins/")
 	parts := strings.Split(strings.Trim(rest, "/"), "/")
@@ -137,19 +156,17 @@ func (s *Server) pluginOne(w http.ResponseWriter, r *http.Request) {
 		var body struct {
 			PluginID string `json:"plugin_id"`
 			Version  string `json:"version"`
-			Source   string `json:"source_url"`
-			Purge    bool   `json:"purge"` // 连旧布局遗留的 auths/logs/stat 一起删（默认只退软件）
 		}
-		_ = json.NewDecoder(r.Body).Decode(&body)
+		_ = json.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(&body)
 		switch id {
 		case "install":
-			s.installFrom(w, body.PluginID, body.Version, body.Source)
+			s.installFrom(w, r.Context(), body.PluginID, body.Version)
 		case "upgrade":
-			s.installLatest(w, body.PluginID)
+			s.installFrom(w, r.Context(), body.PluginID, "")
 		case "rollback":
 			s.doRollback(w, body.PluginID)
 		case "uninstall":
-			s.doUninstall(w, body.PluginID, body.Purge)
+			s.doUninstall(w, body.PluginID)
 		}
 		return
 	}
@@ -171,7 +188,7 @@ func (s *Server) pluginOne(w http.ResponseWriter, r *http.Request) {
 		var body struct {
 			Version string `json:"version"`
 		}
-		_ = json.NewDecoder(r.Body).Decode(&body)
+		_ = json.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(&body)
 		if err := s.Store.Activate(id, body.Version); err != nil {
 			writeErr(w, http.StatusBadRequest, err.Error())
 			return
@@ -181,9 +198,9 @@ func (s *Server) pluginOne(w http.ResponseWriter, r *http.Request) {
 	case "rollback":
 		s.doRollback(w, id)
 	case "uninstall":
-		s.doUninstall(w, id, false)
+		s.doUninstall(w, id)
 	case "upgrade":
-		s.installLatest(w, id)
+		s.installFrom(w, r.Context(), id, "")
 	case "history":
 		list, _ := s.Store.List()
 		for _, p := range list {
@@ -208,44 +225,31 @@ func (s *Server) doRollback(w http.ResponseWriter, id string) {
 	writeJSON(w, map[string]any{"ok": true, "version": v, "message": "已回滚到 " + v})
 }
 
-// doUninstall 卸载插件。默认**只删安装树里的二进制**（W3-39 第 1 条：数据已搬到 core 数据根，
-// 安装树里的三个契约目录属旧布局遗留，同样保留）；`purge=true` 才连遗留数据一起删。
-func (s *Server) doUninstall(w http.ResponseWriter, id string, purge bool) {
-	if err := s.Store.Uninstall(id, purge); err != nil {
+// doUninstall 仅卸载安装树，不触碰 core 配置及插件凭据/统计；重装后渠道和账号可恢复。
+func (s *Server) doUninstall(w http.ResponseWriter, id string) {
+	if err := s.Store.Uninstall(id, false); err != nil {
 		writeErr(w, http.StatusInternalServerError, err.Error())
 		return
 	}
 	s.reload()
-	msg := "已卸载 " + id + "（凭据与统计已保留）"
-	if purge {
-		msg = "已卸载 " + id + "（含凭据与统计）"
-	}
-	writeJSON(w, map[string]any{"ok": true, "message": msg, "purged": purge})
+	writeJSON(w, map[string]any{"ok": true, "message": "已卸载 " + id + "（配置、凭据与统计已保留）", "purged": false})
 }
 
 // storeList：GET /gw/plugins/store（裸数组），POST 安装（body 带 plugin_id/version）。
-//
-// 清单来源优先级：`?source=` / body.source_url（用户导入的社区清单 URL）> Dist.Registry（官方 registry 仓）。
-// 列表页只拉一份（指定来源或官方），安装时再按 id 到各来源里找。
 func (s *Server) storeList(w http.ResponseWriter, r *http.Request) {
 	if r.Method == http.MethodPost {
 		var body struct {
 			PluginID string `json:"plugin_id"`
 			Version  string `json:"version"`
-			Source   string `json:"source_url"`
 		}
-		_ = json.NewDecoder(r.Body).Decode(&body)
-		s.installFrom(w, body.PluginID, body.Version, body.Source)
+		_ = json.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(&body)
+		s.installFrom(w, r.Context(), body.PluginID, body.Version)
 		return
 	}
-	src, err := s.listSource(r.URL.Query().Get("source"))
-	if err != nil {
-		writeErr(w, http.StatusBadRequest, err.Error())
-		return
-	}
-	ix, from, signed, err := s.index(r.Context(), src)
-	if err != nil {
-		writeErr(w, http.StatusBadGateway, "清单拉取失败: "+err.Error())
+	force := r.URL.Query().Get("refresh") == "1"
+	snap, err := s.snapshot(r.Context(), force)
+	if err != nil && snap == nil {
+		writeErr(w, http.StatusBadGateway, "注册表拉取失败: "+err.Error())
 		return
 	}
 	installed, _ := s.Store.List()
@@ -253,53 +257,35 @@ func (s *Server) storeList(w http.ResponseWriter, r *http.Request) {
 	for _, i := range installed {
 		byID[i.ID] = i
 	}
-	list := ix.Plugins
-	if r.URL.Query().Get("expand") == "1" {
-		list = s.expandPlugins(r.Context(), src, list) // 点开版本下拉时才逐条取详情（有限并发）
-	}
-	out := make([]map[string]any, 0, len(list))
-	for _, c := range list {
+	out := make([]map[string]any, 0, len(snap.Plugins))
+	for _, c := range snap.Plugins {
 		cur := ""
 		if i, ok := byID[c.ID]; ok {
 			cur = i.Current
 		}
-		out = append(out, storeView(c, cur, from, signed, ix.UpdatedAt))
+		out = append(out, storeView(c, cur, snap, err))
 	}
 	writeJSON(w, out)
 }
 
-// expandPlugins 把指针条目展开成完整条目（有限并发 6，一条失败不影响其他，原样保留指针形状）。
-// 只在显式 ?expand=1 时跑：20 个插件串着拉就是 20 次外网往返，商店首屏不该等它。
-func (s *Server) expandPlugins(ctx context.Context, src registry.Source, in []registry.PluginEntry) []registry.PluginEntry {
-	out := make([]registry.PluginEntry, len(in))
-	copy(out, in)
-	sem := make(chan struct{}, 6)
-	var wg sync.WaitGroup
-	for i, p := range in {
-		if !p.IsPointer() {
-			continue
-		}
-		wg.Add(1)
-		go func(i int, p registry.PluginEntry) {
-			defer wg.Done()
-			sem <- struct{}{}
-			defer func() { <-sem }()
-			if got, err := registry.LoadPlugin(ctx, src, p, s.Dist.Opts()); err == nil {
-				out[i] = got
-			}
-		}(i, p)
+// storeErrors：被丢弃的注册文件/版本条目（§1.2 必须透出，不许静默吞掉）。
+func (s *Server) storeErrors(w http.ResponseWriter, r *http.Request) {
+	out := s.cache.Errors(s.Dist.Registry.Key())
+	if out == nil {
+		out = []registry.FileError{}
 	}
-	wg.Wait()
-	return out
+	writeJSON(w, out)
 }
 
 // storeView 商店条目（前端字段：plugin_id/name/kind/installed/version/latest/…）。
-func storeView(c registry.PluginEntry, cur, from string, signed bool, updatedAt string) map[string]any {
-	latest := c.Latest // 指针条目靠索引声明的 latest（不在列表里隔次展开详情）
+//
+// 与 v1 的差异：`catalog_signed` 删除（v2 不验签），`kind` 直接取注册文件的 `type`。
+func storeView(c registry.PluginEntry, cur string, snap *registry.Snapshot, fetchErr error) map[string]any {
+	latest := ""
 	vers := make([]map[string]any, 0, len(c.Versions))
 	for _, v := range c.Versions {
-		vers = append(vers, map[string]any{"version": v.Version, "os": v.OS, "arch": v.Arch,
-			"size": v.Size, "asset": v.Asset, "changelog": v.Changelog})
+		vers = append(vers, map[string]any{"version": v.Version, "file": v.File, "os": v.OS, "arch": v.Arch,
+			"size": v.Size, "changelog": v.Changelog})
 		if latest == "" || registry.CmpSemver(v.Version, latest) > 0 {
 			latest = v.Version
 		}
@@ -309,142 +295,112 @@ func storeView(c registry.PluginEntry, cur, from string, signed bool, updatedAt 
 		conf = map[string]any{"pass": c.Conformance.Pass, "warn": c.Conformance.Warn, "fail": c.Conformance.Fail,
 			"mode": c.Conformance.Mode, "at": c.Conformance.At}
 	}
-	return map[string]any{
-		"plugin_id": c.ID, "name": orDefault(c.Name, c.ID), "description": c.Description, "kind": c.Kind,
-		"repo": c.Repo, "source": orDefault(c.Channel, "official"), "icon": c.Icon, "color": c.Color,
+	from, at := "", ""
+	if snap != nil {
+		from = snap.Source
+		if !snap.FetchedAt.IsZero() {
+			at = snap.FetchedAt.UTC().Format(time.RFC3339)
+		}
+	}
+	v := map[string]any{
+		"plugin_id": c.ID, "name": orDefault(c.Name, c.ID), "description": c.Description, "kind": c.Type,
+		"repo": c.Repo, "source": "official", "icon": c.Icon, "color": c.Color,
 		"capabilities": c.Capabilities, "author": orDefault(c.Author, "wild-work3"),
 		"installed": cur != "", "version": cur, "latest": latest, "versions": vers,
-		// detail=false 表示这是指针条目，版本列表需要展开（前端点开下拉时用 ?expand=1 再拉一次）
-		"detail": len(c.Versions) > 0,
-		// W3-38 透明度字段：清单从哪拿的、多旧、有没有验签、准入结果
-		"status": orDefault(c.Status, "unverified"), "verified_at": c.VerifiedAt,
-		"conformance": conf, "catalog_source": from, "catalog_signed": signed,
-		"catalog_updated_at": updatedAt,
+		"installable": c.Installable(),
+		// W3-48 透明度字段：注册表从哪拿的、多旧、准入结果
+		"status": orDefault(c.Status, "unverified"), "conformance": conf,
+		"catalog_source": from, "catalog_updated_at": at,
 	}
+	if fetchErr != nil {
+		v["catalog_error"] = fetchErr.Error() // 陈旧快照：面板要能看出「这是上次的」
+	}
+	return v
 }
 
-// listSource 解析「列商店」用的清单来源。
-func (s *Server) listSource(give string) (registry.Source, error) {
-	if give != "" {
-		return registry.Source{URL: give, Name: "custom"}, nil
+// snapshot 取注册表快照（走 TTL 缓存；失败时返回旧快照 + 错误）。
+func (s *Server) snapshot(ctx context.Context, force bool) (*registry.Snapshot, error) {
+	src := s.Dist.Registry
+	if src.Empty() {
+		return nil, fmt.Errorf("未配置注册表仓（registry_repo / --registry）")
 	}
-	if s.Dist.Registry.Ref.OwnerRepo != "" || s.Dist.Registry.URL != "" {
-		return s.Dist.Registry, nil
+	if force {
+		s.cache.Invalidate(src.Key())
 	}
-	return registry.Source{}, fmt.Errorf("未配置插件清单来源（registry_repo / --registry）")
+	return s.cache.Get(ctx, src, s.Dist.Opts(), s.Dist.indexTTL())
 }
 
-// index 取清单（走 TTL 缓存；失败时上层会拿到旧副本 + 错误）。
-func (s *Server) index(ctx context.Context, src registry.Source) (*registry.Index, string, bool, error) {
-	ix, from, signed, _, err := s.cache.Get(ctx, src, s.Dist.PubKeys, s.Dist.Opts(), s.Dist.indexTTL())
-	return ix, from, signed, err
-}
-
-func (s *Server) installFrom(w http.ResponseWriter, pluginID, version, source string) {
+// installFrom 安装/升级：按 id 在注册表快照里找条目 → 选版本 → 定位发布包 → 下载校验 → 安装。
+//
+// v2 只有一条来源（官方注册表），没有 `source_url` 覆盖（§9.1）。
+func (s *Server) installFrom(w http.ResponseWriter, ctx context.Context, pluginID, version string) {
 	if pluginID == "" {
 		writeErr(w, http.StatusBadRequest, "plugin_id 必填")
 		return
 	}
-	srcs := s.installSources(source)
-	if len(srcs) == 0 {
-		writeErr(w, http.StatusBadRequest, "未配置插件清单来源（registry_repo / --registry）")
+	snap, err := s.snapshot(ctx, false)
+	if err != nil && snap == nil {
+		writeErr(w, http.StatusBadGateway, "注册表拉取失败: "+err.Error())
 		return
 	}
-	ctx := context.Background()
-	for _, src := range srcs {
-		ix, _, _, err := s.index(ctx, src)
-		if err != nil || ix == nil {
-			continue // 某一份清单拉不到不阻断，继续找下一个来源
-		}
-		p, ok := ix.PluginByID(pluginID)
-		if !ok {
-			continue
-		}
-		if p.IsPointer() {
-			// 详情文件与索引同位置解析：registry 仓走同一 release（同 tag），社区清单走同目录
-			got, err := registry.LoadPlugin(ctx, src, p, s.Dist.Opts())
-			if err != nil {
-				writeErr(w, http.StatusBadGateway, err.Error())
-				return
-			}
-			p = got
-		}
-		ver, ok := pickVersion(p.Versions, version)
-		if !ok {
-			writeErr(w, http.StatusBadRequest, "清单中无本平台可用版本: "+pluginID)
-			return
-		}
-		from, err := s.Store.Install(p, ver, s.deps())
-		if err != nil {
-			writeErr(w, http.StatusInternalServerError, err.Error())
-			return
-		}
-		s.reload()
-		writeJSON(w, map[string]any{"ok": true, "plugin_id": p.ID, "version": ver.Version,
-			"source": from, "message": orDefault(p.Name, p.ID) + " 已安装 " + ver.Version})
+	p, ok := snap.PluginByID(pluginID)
+	if !ok {
+		writeErr(w, http.StatusNotFound, "注册表中无此插件: "+pluginID)
 		return
 	}
-	writeErr(w, http.StatusNotFound, "清单中无此插件: "+pluginID)
-}
-
-func (s *Server) installLatest(w http.ResponseWriter, id string) {
-	s.installFrom(w, id, "", "")
-}
-
-// installSources 安装时按序查找的清单来源：显式指定 > 官方 > 已导入的社区。
-func (s *Server) installSources(source string) []registry.Source {
-	if source != "" {
-		return []registry.Source{{URL: source, Name: "custom"}}
+	ver, ok := p.Pick(version)
+	if !ok {
+		avail := make([]string, 0, len(p.Versions))
+		for _, v := range p.Versions {
+			avail = append(avail, v.Version)
+		}
+		writeErr(w, http.StatusBadRequest, fmt.Sprintf("注册表条目 %s 无可用版本 %q（可用：%s）",
+			pluginID, version, strings.Join(avail, ", ")))
+		return
 	}
-	var out []registry.Source
-	if s.Dist.Registry.Ref.OwnerRepo != "" || s.Dist.Registry.URL != "" {
-		out = append(out, s.Dist.Registry)
+	from, err := s.Store.Install(p, ver, s.deps())
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, err.Error())
+		return
 	}
-	out = append(out, s.Dist.Community...)
-	return out
+	s.reload()
+	writeJSON(w, map[string]any{"ok": true, "plugin_id": p.ID, "version": ver.Version,
+		"source": from, "message": orDefault(p.Name, p.ID) + " 已安装 " + ver.Version})
 }
 
-// deps 组装 store 安装参数（host allowlist + 版本门 + 竞速判据）。
+// deps 组装 store 安装参数（host allowlist + 版本门 + 竞速判据 + 发布包定位器）。
 func (s *Server) deps() store.Deps {
+	o := s.Dist.Opts()
 	return store.Deps{
 		Proxies:     s.Dist.Proxies,
 		AllowHosts:  registry.AllowHosts(s.Dist.Proxies, s.Dist.ExtraHosts...),
 		ProtocolVer: s.Dist.ProtocolVer,
 		GatewayVer:  s.Version["gateway"],
-		Opt:         s.Dist.Opts(),
+		Opt:         o,
+		Locator:     registry.NewLocator(o),
 	}
 }
 
-// ---- 更新（gateway 自身 / core）----
-// 实现在 update.go：gateway 分支按 W3-38 恒回「需手动全包替换」，core 分支走真更新（rename trick）。
-
-// registryRefresh 强制重拉清单（面板「重新拉清单」按钮：装了新插件不想等 30min TTL）。
-// body 可带 `{"source_url": "..."}` 刷当前正在看的那一份（社区清单同样适用）。
+// registryRefresh 强制重拉注册表（面板「重新拉清单」按钮：装了新插件不想等 TTL）。
 func (s *Server) registryRefresh(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		writeErr(w, http.StatusMethodNotAllowed, "方法不允许")
 		return
 	}
-	var body struct {
-		SourceURL string `json:"source_url"`
-	}
-	_ = json.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(&body) // 无 body 也算正常
 	src := s.Dist.Registry
-	if body.SourceURL != "" {
-		src = registry.Source{URL: body.SourceURL, Name: "custom"}
-	}
-	if src.Ref.OwnerRepo == "" && src.URL == "" {
-		writeErr(w, http.StatusBadRequest, "未配置插件清单来源（registry_repo / --registry）")
+	if src.Empty() {
+		writeErr(w, http.StatusBadRequest, "未配置注册表仓（registry_repo / --registry）")
 		return
 	}
 	s.cache.Invalidate(src.Key())
-	ix, from, signed, err := s.index(r.Context(), src)
+	snap, err := s.snapshot(r.Context(), true)
 	if err != nil {
-		writeErr(w, http.StatusBadGateway, "清单拉取失败: "+err.Error())
+		writeErr(w, http.StatusBadGateway, "注册表拉取失败: "+err.Error())
 		return
 	}
-	writeJSON(w, map[string]any{"ok": true, "plugins": len(ix.Plugins), "source": from,
-		"signed": signed, "updated_at": ix.UpdatedAt, "message": "已刷新清单"})
+	writeJSON(w, map[string]any{"ok": true, "plugins": len(snap.Plugins), "source": snap.Source,
+		"updated_at": snap.FetchedAt.UTC().Format(time.RFC3339), "errors": len(snap.Errors),
+		"message": "已刷新注册表"})
 }
 
 func (s *Server) shutdown(w http.ResponseWriter, r *http.Request) {
@@ -458,38 +414,6 @@ func (s *Server) reload() {
 	if s.ReloadFn != nil {
 		s.ReloadFn()
 	}
-}
-
-// pickVersion 选版本：指定了就精确匹配，否则取当前平台（os/arch 缺省视为通用）里版本号最高的，
-// 不依赖清单的书写顺序（registry 里版本可能倒序写）。
-func pickVersion(vers []registry.AssetEntry, want string) (registry.AssetEntry, bool) {
-	if len(vers) == 0 {
-		return registry.AssetEntry{}, false
-	}
-	if want != "" {
-		for _, v := range vers {
-			if v.Version == want {
-				return v, true
-			}
-		}
-		return registry.AssetEntry{}, false
-	}
-	best := -1
-	for i, v := range vers {
-		if v.OS != "" && v.OS != runtime.GOOS {
-			continue
-		}
-		if v.Arch != "" && v.Arch != runtime.GOARCH {
-			continue
-		}
-		if best < 0 || registry.CmpSemver(v.Version, vers[best].Version) > 0 {
-			best = i
-		}
-	}
-	if best < 0 {
-		return registry.AssetEntry{}, false
-	}
-	return vers[best], true
 }
 
 func writeJSON(w http.ResponseWriter, v any) {

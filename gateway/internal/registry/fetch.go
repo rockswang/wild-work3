@@ -24,6 +24,7 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -50,6 +51,24 @@ type Options struct {
 	MaxBody   int64         // 0 → 8MiB（仅 Fetch/Probe 用）
 	Total     time.Duration // 0 → 10min
 	Client    *http.Client  // nil → 新建（不设 Timeout，靠 ctx + 三条判据；nil Transport 以继承环境代理）
+	// GitHubBase / CodeloadBase 发布页与 tarball 的基址，空则用内置常量。
+	// 只为离线夹具与 mock 上游留口子（生产永远走 github.com）。
+	GitHubBase   string
+	CodeloadBase string
+}
+
+func (o Options) githubBase() string {
+	if o.GitHubBase != "" {
+		return strings.TrimSuffix(o.GitHubBase, "/")
+	}
+	return GitHubBase
+}
+
+func (o Options) codeloadBase() string {
+	if o.CodeloadBase != "" {
+		return strings.TrimSuffix(o.CodeloadBase, "/")
+	}
+	return CodeloadBase
 }
 
 func (o Options) withDefaults() Options {
@@ -88,9 +107,9 @@ func (e *ErrAllSources) Error() string {
 	return "所有源均失败: " + strings.Join(e.Reasons, "; ")
 }
 
-// Fetch 竞速取一个小文件（清单/签名），返回内容与命中的源 URL。
-func Fetch(ctx context.Context, g GitHubRelease, o Options) ([]byte, string, error) {
-	return FetchURLs(ctx, g.Sources(o.Proxies), o)
+// Fetch 竞速取一个小文件（atom feed / expanded_assets 页），返回内容与命中的源 URL。
+func Fetch(ctx context.Context, urls []string, o Options) ([]byte, string, error) {
+	return FetchURLs(ctx, urls, o)
 }
 
 // FetchURLs 与 Fetch 同，但源集合由调用方展开（绝对 URL 场景）。
@@ -132,10 +151,64 @@ func FetchURLs(ctx context.Context, urls []string, o Options) ([]byte, string, e
 	return nil, "", &ErrAllSources{Reasons: errs}
 }
 
+// errNotModified 条件请求命中 304（内容未变，调用方复用本地快照）。
+var errNotModified = errors.New("304 not modified")
+
+// FetchConditional 与 FetchURLs 同（多源并发竞速），但每个源带自己的 If-None-Match。
+// 任一源回 304 → notModified=true，body 为 nil（内容没变，用本地快照即可）。
+// 返回命中源的 ETag，供下次条件请求使用。
+func FetchConditional(ctx context.Context, urls []string, o Options, etags map[string]string) (body []byte, src, etag string, notModified bool, err error) {
+	opt := o.withDefaults()
+	if len(urls) == 0 {
+		return nil, "", "", false, errors.New("源集合为空")
+	}
+	ctx, cancel := context.WithTimeout(ctx, opt.Total)
+	defer cancel()
+	type res struct {
+		body []byte
+		src  string
+		etag string
+		nm   bool
+		err  error
+	}
+	ch := make(chan res, len(urls))
+	var wg sync.WaitGroup
+	for _, u := range urls {
+		wg.Add(1)
+		go func(u string) {
+			defer wg.Done()
+			w := &limitWriter{cap: opt.MaxBody}
+			_, _, respETag, perr := pullWith(ctx, opt, u, "", w, nil, etags[u])
+			if perr == errNotModified {
+				ch <- res{src: u, etag: respETag, nm: true}
+				return
+			}
+			if perr == nil {
+				w.b = w.buf.Bytes()
+			}
+			ch <- res{w.b, u, respETag, false, perr}
+		}(u)
+	}
+	go func() { wg.Wait(); close(ch) }()
+	var errs []string
+	for r := range ch {
+		if r.err == nil && r.nm {
+			cancel()
+			return nil, r.src, r.etag, true, nil
+		}
+		if r.err == nil {
+			cancel()
+			return r.body, r.src, r.etag, false, nil
+		}
+		errs = append(errs, shortURL(r.src)+": "+r.err.Error())
+	}
+	return nil, "", "", false, &ErrAllSources{Reasons: errs}
+}
+
 // Probe 用 Range 探目标资产前 64KB，确认可达且不太慢再提示「可更新」。
 // 依据：实测 64B/64KB 小请求三源全通（1.3–1.5s），而 18MB 整包经 gh-proxy 12s 只走 994KB。
-func Probe(ctx context.Context, g GitHubRelease, o Options) (int64, string, error) {
-	return ProbeURLs(ctx, g.Sources(o.Proxies), o)
+func Probe(ctx context.Context, urls []string, o Options) (int64, string, error) {
+	return ProbeURLs(ctx, urls, o)
 }
 
 // ProbeURLs 与 Probe 同，但源集合由调用方给出（测试/绝对 URL 场景）。
@@ -212,11 +285,17 @@ func FetchFile(ctx context.Context, urls []string, dest, wantSHA string, o Optio
 	ctx, cancel := context.WithTimeout(ctx, opt.Total)
 	defer cancel()
 	type res struct {
+		i   int
 		src string
 		err error
 	}
 	ch := make(chan res, len(urls))
 	var wg sync.WaitGroup
+	// 只允许一个源落盘 dest：多源同时成功时（直连与代理形态指向同一内容），
+	// 后到者若也做 Remove+Rename，会与赢家之后的解压抢同一个 pkg.zip，
+	// Windows 上表现为「解压失败: ... being used by another process」。
+	var winner atomic.Int32
+	winner.Store(-1)
 	for i, u := range urls {
 		wg.Add(1)
 		go func(i int, u string) {
@@ -224,23 +303,31 @@ func FetchFile(ctx context.Context, urls []string, dest, wantSHA string, o Optio
 			tmp := fmt.Sprintf("%s.%d", dest, i)
 			err := pullFile(ctx, opt, u, tmp, wantSHA, onProgress)
 			if err == nil {
-				_ = os.Remove(dest)
-				if rerr := os.Rename(tmp, dest); rerr != nil {
-					err = fmt.Errorf("落盘失败: %w", rerr)
+				if winner.CompareAndSwap(-1, int32(i)) {
+					_ = os.Remove(dest)
+					if rerr := os.Rename(tmp, dest); rerr != nil {
+						winner.Store(-1) // 让还在跑的源继续争
+						err = fmt.Errorf("落盘失败: %w", rerr)
+					}
+				} else {
+					_ = os.Remove(tmp) // 已有人落盘，自己这份多余
 				}
 			}
 			// 失败的源：pullFile 已在 sha 不匹配时删 tmp；软失败保留半包供下一轮续传
-			ch <- res{u, err}
+			ch <- res{i, u, err}
 		}(i, u)
 	}
 	go func() { wg.Wait(); close(ch) }()
 	var errs []string
 	for r := range ch {
-		if r.err == nil {
-			cancel() // 赢家产生，其余源作废（它们的 tmp 保留，下次可续传）
+		if r.err == nil && winner.Load() == int32(r.i) {
+			cancel()  // 赢家已落盘，其余作废（它们的 tmp 保留，下次可续传）
+			wg.Wait() // 必须等所有 goroutine 真正退出：否则输家仍可能在动 tmp/dest，与后续解压抢文件
 			return r.src, nil
 		}
-		errs = append(errs, shortURL(r.src)+": "+r.err.Error())
+		if r.err != nil {
+			errs = append(errs, shortURL(r.src)+": "+r.err.Error())
+		}
 	}
 	return "", &ErrAllSources{Reasons: errs}
 }
@@ -278,11 +365,21 @@ func pullFile(ctx context.Context, o Options, url, tmp, wantSHA string, onProgre
 // 每次只交 512B，健康源被误判成 1KB/s 吐掉）。现在数据与定时器在同一个 select 里争抢，
 // 窗口内能连续收数据，判据才是真的「吞吐」而不是「轮询频率」。
 func pull(ctx context.Context, o Options, url, tmp string, w io.Writer, onProgress Progress) (int64, error) {
+	n, _, _, err := pullWith(ctx, o, url, tmp, w, onProgress, "")
+	return n, err
+}
+
+// pullWith 同 pull，额外支持条件请求（etag 非空则带 If-None-Match）并回传响应状态与 ETag。
+// 304 时返回 errNotModified（调用方据此复用本地快照）。
+func pullWith(ctx context.Context, o Options, url, tmp string, w io.Writer, onProgress Progress, etag string) (int64, int, string, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
-		return 0, err
+		return 0, 0, "", err
 	}
 	req.Header.Set("User-Agent", userAgent)
+	if etag != "" {
+		req.Header.Set("If-None-Match", etag)
+	}
 	var off int64
 	if hw, ok := w.(*hashWriter); ok && hw.off > 0 {
 		off = hw.off
@@ -290,25 +387,28 @@ func pull(ctx context.Context, o Options, url, tmp string, w io.Writer, onProgre
 	}
 	resp, err := o.Client.Do(req)
 	if err != nil {
-		return 0, err
+		return 0, 0, "", err
 	}
 	defer resp.Body.Close()
+	respETag := resp.Header.Get("ETag")
 	switch resp.StatusCode {
 	case http.StatusOK, http.StatusPartialContent:
+	case http.StatusNotModified:
+		return 0, resp.StatusCode, respETag, errNotModified
 	case http.StatusRequestedRangeNotSatisfiable:
 		if tmp != "" {
 			_ = os.Remove(tmp) // 本地半包比远端还长，删掉重来
 		}
-		return 0, errors.New("range 不可满足（本地半包长于远端资产）")
+		return 0, resp.StatusCode, respETag, errors.New("range 不可满足（本地半包长于远端资产）")
 	default:
 		b, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
-		return 0, fmt.Errorf("HTTP %d %s", resp.StatusCode, strings.TrimSpace(string(b)))
+		return 0, resp.StatusCode, respETag, fmt.Errorf("HTTP %d %s", resp.StatusCode, strings.TrimSpace(string(b)))
 	}
 	// 200 = 服务端不理 Range，只能整包重来：必须截断本地半包并回卷 hasher
 	if resp.StatusCode == http.StatusOK && off > 0 {
 		if hw, ok := w.(*hashWriter); ok {
 			if err := hw.reset(); err != nil {
-				return 0, err
+				return 0, resp.StatusCode, respETag, err
 			}
 		}
 		off = 0
@@ -377,33 +477,33 @@ func pull(ctx context.Context, o Options, url, tmp string, w io.Writer, onProgre
 		}
 		return nil
 	}
-	abort := func(format string, args ...any) (int64, error) {
-		return done, fmt.Errorf(format, args...)
+	abort := func(format string, args ...any) (int64, int, string, error) {
+		return done, resp.StatusCode, respETag, fmt.Errorf(format, args...)
 	}
 
 	for {
 		select {
 		case c, ok := <-ch:
 			if !ok { // 读体 goroutine 已退（理论上先到 err）
-				return done, io.ErrUnexpectedEOF
+				return done, resp.StatusCode, respETag, io.ErrUnexpectedEOF
 			}
 			if len(c.b) > 0 {
 				if err := handleData(c.b); err != nil {
-					return done, err
+					return done, resp.StatusCode, respETag, err
 				}
 				bufs <- c.b[:cap(c.b)] // 回坑位，接着读
 			}
 			if c.err != nil {
 				if c.err == io.EOF {
-					return done, nil
+					return done, resp.StatusCode, respETag, nil
 				}
 				if ctx.Err() != nil {
-					return done, ctx.Err() // 被赢家取消，不算自身失败
+					return done, resp.StatusCode, respETag, ctx.Err() // 被赢家取消，不算自身失败
 				}
-				return done, c.err
+				return done, resp.StatusCode, respETag, c.err
 			}
 		case <-ctx.Done():
-			return done, ctx.Err()
+			return done, resp.StatusCode, respETag, ctx.Err()
 		case <-firstC:
 			return abort("首字节超时（%v 内无数据）", o.FirstByte)
 		case <-idleC:

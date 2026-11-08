@@ -24,8 +24,9 @@ type EventHandler func(ev *jsonl.Msg) error
 // Callback 是事件分发的 sentinel：当 Invoke 收到 event 时交由回调，收到 result 时结束。
 // Cancel 通知被调方取消当前请求。
 //
-// OnID 在 invoke 发出前被调用，给出本次调用的 id——双向流（W3-26）里调用方
-// 需要用它在同一 id 上回灌事件（Client.Emit）。
+// OnID 在 invoke 帧**写出之后**被调用，给出本次调用的 id——双向流（W3-26）里调用方
+// 需要用它在同一 id 上回灌事件（Client.Emit）。顺序不可反：先回灌会让 push 抢在 invoke
+// 之前到达服务端，而服务端按 id 查在途流查不到 → stdio 形态静默丢帧、call 形态直接报错。
 type Callback struct {
 	OnEvent EventHandler
 	OnID    func(id string)
@@ -142,9 +143,6 @@ func (c *Client) Invoke(ctx context.Context, method string, params any, cb *Call
 		p = b
 	}
 	req := &jsonl.Msg{V: 1, ID: id, Op: jsonl.OpInvoke, Method: method, Params: p}
-	if cb != nil && cb.OnID != nil {
-		cb.OnID(id)
-	}
 	ch := make(chan *resultMsg, 16)
 	c.mu.Lock()
 	c.inFlight[id] = ch
@@ -156,6 +154,10 @@ func (c *Client) Invoke(ctx context.Context, method string, params any, cb *Call
 	}()
 	if err := c.send(req); err != nil {
 		return jsonl.Msg{}, nil, err
+	}
+	// OnID 必须在 send 之后（见 Callback 注释）：调用方一拿到 id 就会开始 push。
+	if cb != nil && cb.OnID != nil {
+		cb.OnID(id)
 	}
 	for {
 		select {

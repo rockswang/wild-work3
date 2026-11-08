@@ -15,7 +15,7 @@ import (
 
 // 认证（登录）转发：core 只做三件事——挑渠道、把 authflow 调用转给插件、把成功后的账号事实落库。
 //
-// 契约见 docs/AUTH_FLOW.md 与 PLUGIN_PROTOCOL §5.3：
+// 契约见 protocol/docs/AUTH_FLOW.md 与 PLUGIN_PROTOCOL §5.3：
 //   - 登录流程与凭据完全归插件（凭据绝不经过 IPC，W3-07）
 //   - core 不关心具体是哪种登录方式，只按 authflow.Type 的三个判据决定 UI 行为
 //     （NeedsPoll / NeedsBrowser / CanPasteCallback），因此新增渠道不需要改 core

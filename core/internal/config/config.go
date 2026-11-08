@@ -23,6 +23,10 @@ type ChannelConfig struct {
 	Enabled     bool           `json:"enabled"`
 	Config      map[string]any `json:"config"` // 插件专属配置（base_url/api_key/...）
 	Models      []string       `json:"models,omitempty"`
+	// DefaultID 是「该实例由插件 default_channels 哪个 ID 预置」的印记（改名后仍保留原值）。
+	// 不存这个印记，改名后的内建渠道会在下次启动被 seedDefaultChannels 当成缺失而重建一份，
+	// 结果是同一个上游凭空多出一个渠道实例（W3-45）。
+	DefaultID string `json:"default_id,omitempty"`
 	// 运行时字段（不持久化到配置文件，但便于前端读取，落盘时清空）
 	PluginVersion string `json:"plugin_version,omitempty"`
 }
@@ -419,4 +423,100 @@ func (s *Store) Channel(id string) *ChannelConfig {
 		}
 	}
 	return nil
+}
+
+// RenameChannel 渠道实例改名：同步改写渠道 ID 与全部账号主键/归属（W3-45）。
+//
+// 只改内存配置并落盘；池与账本的迁移由调用方（api.Server）紧接着做——
+// 它们属于运行期状态，不在本包的职责里。
+//
+// 账号主键形态两种：无凭据渠道的虚拟账号 UID 恰为渠道 ID；其余为 `<插件侧uid>@<渠道ID>`。
+func (s *Store) RenameChannel(oldID, newID string) error {
+	if oldID == "" || newID == "" || oldID == newID {
+		return nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, c := range s.cfg.Channels {
+		if c.ID == oldID {
+			c.ID = newID
+		}
+	}
+	for _, a := range s.cfg.Accounts {
+		if a.ChannelID != oldID {
+			continue
+		}
+		a.ChannelID = newID
+		if a.UID == oldID {
+			a.UID = newID // 虚拟账号：UID 即渠道 ID
+			continue
+		}
+		if suffix := "@" + oldID; len(a.UID) > len(suffix) && a.UID[len(a.UID)-len(suffix):] == suffix {
+			a.UID = a.UID[:len(a.UID)-len(suffix)] + "@" + newID
+		}
+	}
+	// 模型路由/降级链/兼容映射里引用旧渠道 ID 的也要跟着走，否则改名后路由凭空断掉。
+	for model, ch := range s.cfg.ModelRoutes {
+		if ch == oldID {
+			s.cfg.ModelRoutes[model] = newID
+		}
+	}
+	if s.cfg.DefaultChannel == oldID {
+		s.cfg.DefaultChannel = newID
+	}
+	return s.saveLocked()
+}
+
+// RenameRuleChannel 把用户规则覆盖里 scope.channels 的旧渠道 ID 换成新的（W3-45）。
+//
+// 渠道级规则（W3-35 的 Pass B）按渠道实例 ID 命中。改名后若不改规则，规则会静默失效
+// ——用户看不到任何报错，只觉得「我配的脱敏/改写规则突然不管用了」。
+// 默认规则集内嵌只读，故只处理用户覆盖段。
+func (s *Store) RenameRuleChannel(oldID, newID string) error {
+	if oldID == "" || newID == "" || oldID == newID {
+		return nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.file.Update(appconfig.SectionRules, func(cur json.RawMessage) (json.RawMessage, error) {
+		if len(cur) == 0 {
+			return nil, nil
+		}
+		var over map[string]json.RawMessage
+		if err := json.Unmarshal(cur, &over); err != nil {
+			return nil, err // 坏段不猜：宁可报错也不覆盖用户规则
+		}
+		changed := false
+		for id, raw := range over {
+			var obj map[string]any
+			if json.Unmarshal(raw, &obj) != nil {
+				continue
+			}
+			sc, ok := obj["scope"].(map[string]any)
+			if !ok {
+				continue
+			}
+			list, ok := sc["channels"].([]any)
+			if !ok {
+				continue
+			}
+			hit := false
+			for i, v := range list {
+				if s, ok := v.(string); ok && s == oldID {
+					list[i], hit = newID, true
+				}
+			}
+			if !hit {
+				continue
+			}
+			sc["channels"] = list
+			if b, err := json.Marshal(obj); err == nil {
+				over[id], changed = b, true
+			}
+		}
+		if !changed {
+			return cur, nil
+		}
+		return json.Marshal(over)
+	})
 }

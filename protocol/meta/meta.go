@@ -12,9 +12,22 @@ type Manifest struct {
 	Protocol     ProtocolRng  `json:"protocol"`
 	Execution    Execution    `json:"execution"`
 	Capabilities Capabilities `json:"capabilities,omitempty"`
-	Icon         string       `json:"icon,omitempty"`
-	Color        string       `json:"color,omitempty"`
-	Description  string       `json:"description,omitempty"`
+	// DefaultChannels 声明安装后应存在的渠道实例；空表表示不自动创建。
+	// initialize 返回同一份 Manifest，旧插件不带此字段仍可正常运行。
+	DefaultChannels []DefaultChannel `json:"default_channels,omitempty"`
+	// MultiChannels=true：本插件的渠道实例由用户在面板里自建（可任意多个），不靠 default_channels 预置。
+	// 实例 ID 就是模型命名空间前缀（custom-api 这类「一个端点 = 一个前缀」的渠道；W3-44）。
+	MultiChannels bool   `json:"multi_channels,omitempty"`
+	Icon          string `json:"icon,omitempty"`
+	Color         string `json:"color,omitempty"`
+	Description   string `json:"description,omitempty"`
+}
+
+// DefaultChannel 是插件自带的渠道实例模板。Config 仅含可公开的默认值，不含凭据。
+type DefaultChannel struct {
+	ID     string         `json:"id"`
+	Name   string         `json:"name"`
+	Config map[string]any `json:"config,omitempty"`
 }
 
 // ProtocolRng 协议版本兼容区间。

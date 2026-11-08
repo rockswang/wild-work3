@@ -34,12 +34,12 @@ const gatewayVersion = "1.0.0"
 // protocolVersion 当前 IPC 协议版本（版本门比较基准，与 main/protocol 保持一致）。
 const protocolVersion = 1
 
-// 缺省分发位置（W3-38：一律走 releases/latest/download，不用 api.github.com 也不用 raw）。
+// 缺省分发位置（W3-48 v2）：注册表 = 平铺注册文件的独立仓，一次 tarball 全拿。
+//
+// 包体不在注册表仓：注册文件只给 `repo` + `version`，由发布页（tags.atom / expanded_assets）定位。
 const (
-	defaultRegistryRepo = "wild-work3/ww3-registry"
-	defaultMainRepo     = "wild-work3/wild-work3"
-	defaultIndexAsset   = "index.json"
-	defaultMainAsset    = "update.json"
+	defaultRegistryRepo = "wild-work3/ww3-ext-registry"
+	defaultRegistryRef  = "main"
 )
 
 // defaultProxies 国内可达的 release 资产代理（实测同一条 URL 直连/gh-proxy/ghfast 均通 206）。
@@ -69,19 +69,16 @@ func main() {
 	coreExe := cServe.Str("core", defaultCoreExe(), "core 可执行文件路径")
 	dataDir := cServe.Str("data", defaultDataDir(), "数据目录")
 	pluginsDir := cServe.Str("plugins", defaultPluginsDir(), "插件目录")
-	registryRepo := cServe.Str("registry", "", "插件清单仓（owner/repo，取 releases/latest/download/index.json；缺省读配置，否则 "+defaultRegistryRepo+"）")
-	mainRepo := cServe.Str("main-repo", "", "主程序清单仓（owner/repo，取 update.json；缺省 "+defaultMainRepo+"）")
+	registryRepo := cServe.Str("registry", "", "插件注册表仓（owner/repo，取 codeload tarball 枚举根目录注册文件；缺省读配置，否则 "+defaultRegistryRepo+"）")
+	registryRef := cServe.Str("registry-ref", "", "注册表仓的分支/tag/commit（缺省读配置，否则 "+defaultRegistryRef+"）")
 	proxies := cServe.StrList("proxy", "下载代理前缀（可重复传，与直连并发竞速；缺省读配置，否则内置两个）")
-	pubKeys := cServe.StrList("pubkey", "清单验签公钥（ed25519 hex，可重复；未配则面板标「未验签」）")
-	distHosts := cServe.StrList("dist-host", "额外允许的下载主机（社区自建站，可重复）")
-	community := cServe.StrList("community", "社区插件清单 URL（可重复，商店合并展示）")
 	noTray := cServe.Bool("no-tray", false, "无头模式：不创建托盘图标（服务/无桌面环境）")
 
 	// W3-38：gateway 不参与自动升级，所手改路径必须能在命令行上直接拿到。
 	app.SetVersion(func() string {
 		self := selfExe()
-		return fmt.Sprintf("wild-work3 gateway %s｜IPC 协议 %d｜core 可执行=%s\n手动升级：先停进程，把 %s 改名（+%s.old）再放入新文件；\n期望包位：https://github.com/%s/releases/latest",
-			gatewayVersion, protocolVersion, absPath(defaultCoreExe()), filepath.Base(self), filepath.Base(self), defaultMainRepo)
+		return fmt.Sprintf("wild-work3 gateway %s｜IPC 协议 %d｜core 可执行=%s\n手动升级：先停进程，把 %s 改名（+%s.old）再放入新文件；\n期望包位：https://github.com/%s/releases",
+			gatewayVersion, protocolVersion, absPath(defaultCoreExe()), filepath.Base(self), filepath.Base(self), defaultRegistryRepo)
 	})
 
 	cChat := app.Cmd("chat", "命令行直接对话（走 gateway→core IPC，与 /v1 同一条链路）")
@@ -186,7 +183,7 @@ func main() {
 
 	st := store.New(plugins)
 	gws := &gw.Server{Store: st, Version: map[string]string{"gateway": gatewayVersion, "protocol": strconv.Itoa(protocolVersion)},
-		Dist:   distFor(cfgStore.Get(), *registryRepo, *mainRepo, *proxies, *pubKeys, *distHosts, *community),
+		Dist:   distFor(cfgStore.Get(), *registryRepo, *registryRef, *proxies),
 		OnQuit: func() { shutdown(coreIPC) }}
 	gws.CoreVersionFn = func() map[string]string { return map[string]string{"core": coreVersionHTTP(coreBase)} }
 	// core 更新应用要用：exe 路径、停 core 并等它真退出、替换后重新拉起（W3-38）
@@ -257,7 +254,9 @@ func main() {
 		w.Write(b)
 	})
 
-	handler := hostCheck(listenAddr, adminAuth(func() string { return cfgStore.Get().AdminPass }, mux))
+	// 最外层再包 DrainBody：把 handler 没读完的请求体丢掉，否则 net/http 会在回包后直接关连接
+	// （客户端 `ConnectionResetError 10054`，前端也会命中）。
+	handler := hostCheck(listenAddr, gw.DrainBody(adminAuth(func() string { return cfgStore.Get().AdminPass }, mux)))
 	srv := &http.Server{Addr: listenAddr, Handler: handler}
 	l.Infof("监听 http://%s/ （core 管理面 %s）", listenAddr, coreBase)
 
@@ -595,15 +594,17 @@ type gatewayConfig struct {
 	AdminPass  string `json:"admin_password"`
 	CoreListen string `json:"core_listen,omitempty"` // core 管理面监听（缺省 = 对外端口 +1）
 
-	// 分发与更新（W3-38）：清单仓 / 代理 / 公钥 / 允许主机 / 社区清单 / 缓存时长。
+	// 分发与更新（W3-48 v2）：注册表仓 / 分支 / 代理 / 缓存时长。
 	// 一律「CLI > env > 本段 > 内置默认」，且 CLI/env 不落盘。
-	RegistryRepo      string   `json:"registry_repo,omitempty"`
-	MainRepo          string   `json:"main_repo,omitempty"`
-	DownloadProxies   []string `json:"download_proxies,omitempty"`
-	RegistryPubKeys   []string `json:"registry_pubkeys,omitempty"`
-	DistHosts         []string `json:"dist_hosts,omitempty"`
-	CommunityCatalogs []string `json:"community_catalogs,omitempty"`
-	IndexTTLMin       int      `json:"index_ttl_min,omitempty"`
+	RegistryRepo    string   `json:"registry_repo,omitempty"`
+	RegistryRef     string   `json:"registry_ref,omitempty"`
+	DownloadProxies []string `json:"download_proxies,omitempty"`
+	IndexTTLMin     int      `json:"index_ttl_min,omitempty"`
+
+	// GitHubBase/CodeloadBase 发布页与 tarball 的基址（生产留空 = https://github.com / codeload）。
+	// 只给离线夹具与 mock 上游用：e2e 要覆盖「按版本号定位发布包」就必须能把发布页指到本机。
+	GitHubBase   string `json:"github_base,omitempty"`
+	CodeloadBase string `json:"codeload_base,omitempty"`
 }
 
 // defaultGWListen gateway 缺省对外监听（core 缺省听 7864 = 此端口 +1）。
@@ -654,37 +655,43 @@ func loadGWSection(dataDir string) gatewayConfig {
 	return loadGatewaySection(appconfig.OpenData(dataDir))
 }
 
-// distFor 组装分发配置（W3-38）：优先级 CLI > 配置段 > 内置默认。
+// distFor 组装分发配置（W3-48 v2）：优先级 CLI > 配置段 > 内置默认。
 //
 // CLI/env 不落盘（W3-35 同一口径），所以这里只算本次生效值。
-func distFor(c gatewayConfig, registryRepo, mainRepo string, proxies, pubKeys, distHosts, community []string) gw.Dist {
+func distFor(c gatewayConfig, registryRepo, registryRef string, proxies []string) gw.Dist {
 	prx := append([]string{}, firstNonEmptyList(proxies, c.DownloadProxies, defaultProxies)...)
-	pub := append([]string{}, firstNonEmptyList(pubKeys, c.RegistryPubKeys)...)
-	hosts := append([]string{}, firstNonEmptyList(distHosts, c.DistHosts)...)
-	comm := append([]string{}, firstNonEmptyList(community, c.CommunityCatalogs)...)
-	srcs := make([]registry.Source, 0, len(comm))
-	for _, u := range comm {
-		srcs = append(srcs, sourceOf(u, defaultIndexAsset, "community"))
-	}
 	return gw.Dist{
-		Registry:    sourceOf(firstNonEmpty(registryRepo, c.RegistryRepo, defaultRegistryRepo), defaultIndexAsset, "official"),
-		Main:        sourceOf(firstNonEmpty(mainRepo, c.MainRepo, defaultMainRepo), defaultMainAsset, "main"),
-		Community:   srcs,
-		PubKeys:     pub,
+		Registry:    sourceOf(firstNonEmpty(registryRepo, c.RegistryRepo, defaultRegistryRepo), firstNonEmpty(registryRef, c.RegistryRef, defaultRegistryRef)),
 		Proxies:     prx,
-		ExtraHosts:  hosts,
 		ProtocolVer: protocolVersion,
 		TTL:         time.Duration(c.IndexTTLMin) * time.Minute,
+		Fetch: registry.Options{
+			GitHubBase:   c.GitHubBase,
+			CodeloadBase: c.CodeloadBase,
+		},
+		// 基址被改写时（离线夹具/mock 上游）它的主机也要进下载允许列表，否则定位出的 URL 会被 allow 过滤掉。
+		ExtraHosts: hostOfList(c.GitHubBase, c.CodeloadBase),
 	}
 }
 
-// sourceOf 把配置值解释成清单来源：含 `://` 当绝对 URL（本地测试/自建镜像），
-// 否则当 owner/repo（走 releases/latest/download）。
-func sourceOf(val, asset, name string) registry.Source {
+// sourceOf 把配置值解释成注册表来源：含 `://` 当绝对 tarball URL（离线夹具/mock 上游），
+// 否则当 owner/repo（走 codeload tarball）。
+func sourceOf(val, ref string) registry.Source {
 	if strings.Contains(val, "://") {
-		return registry.Source{URL: val, Name: name}
+		return registry.Source{URL: val, Name: "official"}
 	}
-	return registry.Source{Ref: registry.GitHubRelease{OwnerRepo: val, Asset: asset}, Name: name}
+	return registry.Source{Repo: val, Ref: ref, Name: "official"}
+}
+
+// hostOfList 取一组 URL 的主机名（给 Dist.ExtraHosts 用；空串与非法值跳过）。
+func hostOfList(urls ...string) []string {
+	var out []string
+	for _, s := range urls {
+		if u, err := url.Parse(strings.TrimSpace(s)); err == nil && u.Hostname() != "" {
+			out = append(out, u.Hostname())
+		}
+	}
+	return out
 }
 
 func firstNonEmpty(vals ...string) string {

@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"regexp"
 	"strings"
 	"sync"
 	"time"
@@ -85,6 +86,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/api/fees", s.get(s.fees))
 	mux.HandleFunc("/api/logs", s.get(s.logs))
 	mux.HandleFunc("/api/logs/requests", s.get(s.requestLogs))
+	mux.HandleFunc("/api/logs/fails", s.get(s.failLogs))
 	mux.HandleFunc("/api/config", s.route(s.configAll))
 	mux.HandleFunc("/api/config/rules", s.route(s.rulesView))
 	mux.HandleFunc("/api/plugins", s.get(s.plugins))
@@ -182,8 +184,9 @@ func (s *Server) channels(w http.ResponseWriter, r *http.Request) error {
 		if body.PluginID == "" {
 			return errf("plugin_id 必填")
 		}
-		if s.RT.Plugin(body.PluginID) == nil {
-			return errf("插件未安装: %s，请先到插件商店安装", body.PluginID)
+		pl := s.RT.Plugin(body.PluginID)
+		if pl == nil || pl.Met.Kind != "channel" {
+			return errf("渠道插件未安装: %s，请先到插件商店安装", body.PluginID)
 		}
 		id := body.ChannelID
 		if id == "" {
@@ -201,20 +204,28 @@ func (s *Server) channels(w http.ResponseWriter, r *http.Request) error {
 				}
 			}
 		}
+		if err := s.checkChannelID(id); err != nil {
+			return err
+		}
 		name := orDefault(body.DisplayName, id)
 		if err := s.Store.Update(func(c *config.Config) error {
 			c.Channels = append(c.Channels, &config.ChannelConfig{
 				ID: id, PluginID: body.PluginID, DisplayName: name,
 				Enabled: true, Config: body.Config, Models: body.Models,
 			})
-			c.Accounts = append(c.Accounts, &config.Account{
-				UID: id, ChannelID: id, Nickname: name, LoginKind: "api_key",
-			})
+			// 有 auth.begin 的插件通过登录流程/同步导入真实账号；不可插入虚拟 API Key 账号。
+			if !pl.Met.Capabilities.HasControl("auth.begin") {
+				c.Accounts = append(c.Accounts, &config.Account{
+					UID: id, ChannelID: id, Nickname: name, LoginKind: "api_key",
+				})
+			}
 			return nil
 		}); err != nil {
 			return err
 		}
-		s.Pool.Upsert(pool.Entry{UID: id, ChannelID: id, Nickname: name})
+		if !pl.Met.Capabilities.HasControl("auth.begin") {
+			s.Pool.Upsert(pool.Entry{UID: id, ChannelID: id, Nickname: name})
+		}
 		Logf("新增渠道 %s（插件 %s）", id, body.PluginID)
 		// 回显渠道视图（app.js 用 saved.display_name 提示登录向导）
 		for _, v := range s.channelsView() {
@@ -238,10 +249,18 @@ func (s *Server) channelOne(w http.ResponseWriter, r *http.Request) error {
 		return errf("缺少渠道 ID")
 	}
 	ch := s.Store.Channel(id)
+	if ch != nil && s.RT.Plugin(ch.PluginID) == nil {
+		return errf("渠道插件未安装: %s", ch.PluginID)
+	}
 	if ch == nil {
 		// 全局渠道操作（不绑定单个渠道）
-		if id == "models_refresh_all" && len(parts) == 1 {
-			return s.channelModelsRefreshAll(w, r)
+		if len(parts) == 1 {
+			if id == "models_refresh_all" {
+				return s.channelModelsRefreshAll(w, r)
+			}
+			if id == "test" {
+				return s.channelPretest(w, r) // 未落盘的配置预检（自定义模型 Provider 新增/编辑）
+			}
 		}
 		return errf("渠道不存在: %s", id)
 	}
@@ -269,6 +288,13 @@ func (s *Server) channelOne(w http.ResponseWriter, r *http.Request) error {
 			}
 			writeJSON(w, map[string]any{"ok": true, "enabled": en})
 			return nil
+		case "secret":
+			// 明文密钥查看（W3-45，用户口径 m01563 第 3 条：ww 也当凭据管理器用，必须能取明文）。
+			// 仅 GET、仅限 isSecret 字段（挡掉 base_url 等无关字段被当通道乱读）。
+			if r.Method != http.MethodGet {
+				return errf("方法不支持")
+			}
+			return s.channelSecret(w, r, ch)
 		case "models":
 			// 有第三段 refresh → 重新拉取；否则返回当前模型 ID 列表（app.js 期望裸字符串数组）
 			if len(parts) > 2 && parts[2] == "refresh" {
@@ -298,6 +324,7 @@ func (s *Server) channelOne(w http.ResponseWriter, r *http.Request) error {
 		return nil
 	case http.MethodPut:
 		var body struct {
+			ChannelID   *string        `json:"channel_id"` // 非空且不同 → 渠道实例改名（W3-45）
 			DisplayName *string        `json:"display_name"`
 			Enabled     *bool          `json:"enabled"`
 			Config      map[string]any `json:"config"`
@@ -305,6 +332,32 @@ func (s *Server) channelOne(w http.ResponseWriter, r *http.Request) error {
 		}
 		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 			return err
+		}
+		// 改名（用户口径 m01563 第 1 条：端点改名则迁移数据）。
+		// 顺序很要紧：先校验新 ID → 改配置 → 迁池 → 迁账本/规则。任何一步失败都返回错误，
+		// 由前端提示；不做自动回滚（改名是低频人工操作，宁可让用户看到错误再重试一次）。
+		newID := id
+		if body.ChannelID != nil && *body.ChannelID != "" && *body.ChannelID != id {
+			newID = *body.ChannelID
+			if err := s.checkChannelIDForRename(newID, id); err != nil {
+				return err
+			}
+			if err := s.Store.RenameChannel(id, newID); err != nil {
+				return err
+			}
+			s.Pool.RenameChannel(id, newID)
+			if s.Stat != nil {
+				if err := s.Stat.RenameChannel(id, newID); err != nil {
+					Logf("渠道改名：账本迁移失败 %s→%s: %v", id, newID, err)
+				}
+			}
+			if err := s.Store.RenameRuleChannel(id, newID); err != nil {
+				Logf("渠道改名：规则迁移失败 %s→%s: %v", id, newID, err)
+			} else {
+				s.reloadRules() // 规则 scope 变了要重建 Pass B 引擎
+			}
+			Logf("渠道改名 %s → %s（账号/池/账本/规则已迁移）", id, newID)
+			id = newID // 后续配置写入与日志用新 ID
 		}
 		if err := s.Store.Update(func(c *config.Config) error {
 			for _, x := range c.Channels {
@@ -319,13 +372,7 @@ func (s *Server) channelOne(w http.ResponseWriter, r *http.Request) error {
 				}
 				if body.Config != nil {
 					// 未修改的脱敏密钥回填旧值（前端拿不到明文）
-					for k, v := range body.Config {
-						if str, ok := v.(string); ok && strings.HasPrefix(str, "***") {
-							if old, ok := x.Config[k].(string); ok {
-								body.Config[k] = old
-							}
-						}
-					}
+					body.Config = fillMaskedSecrets(body.Config, x.Config)
 					x.Config = body.Config
 				}
 				if body.Models != nil {
@@ -344,7 +391,7 @@ func (s *Server) channelOne(w http.ResponseWriter, r *http.Request) error {
 			}
 		}
 		Logf("更新渠道 %s", id)
-		writeJSON(w, map[string]any{"ok": true})
+		writeJSON(w, map[string]any{"ok": true, "channel_id": id})
 		return nil
 	case http.MethodDelete:
 		if err := s.Store.Update(func(c *config.Config) error {
@@ -354,17 +401,22 @@ func (s *Server) channelOne(w http.ResponseWriter, r *http.Request) error {
 					break
 				}
 			}
-			for i, a := range c.Accounts {
-				if a.ChannelID == id {
-					c.Accounts = append(c.Accounts[:i], c.Accounts[i+1:]...)
-					break
+			remaining := c.Accounts[:0]
+			for _, a := range c.Accounts {
+				if a.ChannelID != id {
+					remaining = append(remaining, a)
 				}
 			}
+			c.Accounts = remaining
 			return nil
 		}); err != nil {
 			return err
 		}
-		s.Pool.Remove(id)
+		for _, a := range s.Pool.List() {
+			if a.ChannelID == id {
+				s.Pool.Remove(a.UID)
+			}
+		}
 		Logf("删除渠道 %s", id)
 		writeJSON(w, map[string]any{"ok": true})
 		return nil
@@ -372,21 +424,161 @@ func (s *Server) channelOne(w http.ResponseWriter, r *http.Request) error {
 	return errf("方法不支持")
 }
 
+// channelSecret 返回渠道配置里某个密钥字段的明文（GET /api/channels/{id}/secret?key=api_key）。
+//
+// 这是 W3-45 对「零 token 落盘」红线（AGENTS §9）的**显式例外**，边界必须守住：
+//   - 只有本机管理面能到（core 只听 127.0.0.1，且 gateway 侧已过管理鉴权）；
+//   - 只回 isSecret 命中且值是非空字符串的字段，其余一律拒绝（不提供「导全部配置」通道）；
+//   - 明文字节**绝不**进日志/审计：审计只写渠道 ID、字段名、来源 IP；
+//   - 不回显在列表/详情视图里（maskConfig 依旧脱敏），只能靠这次显式请求取得。
+func (s *Server) channelSecret(w http.ResponseWriter, r *http.Request, ch *config.ChannelConfig) error {
+	key := r.URL.Query().Get("key")
+	if key == "" {
+		return errf("缺少参数 key")
+	}
+	if !isSecret(key) {
+		return errf("字段不是密钥类（不含 key/token/secret/password），拒绝返回: %s", key)
+	}
+	v, ok := ch.Config[key].(string)
+	if !ok || v == "" {
+		return errf("字段为空或不是字符串: %s", key)
+	}
+	// 审计：只记「谁看了哪个字段」，不记值（红线：日志零 token 落盘）。
+	Logf("审计：读取渠道 %s 的 %s 明文（来源 %s）", ch.ID, key, r.RemoteAddr)
+	writeJSON(w, map[string]any{"ok": true, "key": key, "value": v})
+	return nil
+}
+
 // channelTest 用真实密钥测试连接（调用插件 models.list；W3-15「添加渠道」机制）。
 func (s *Server) channelTest(w http.ResponseWriter, ch *config.ChannelConfig) error {
-	res, err := s.RT.Call(context.Background(), ch.PluginID, "models.list", map[string]any{"config": ch.Config})
+	models, err := s.probeModels(context.Background(), ch.PluginID, ch.Config)
 	if err != nil {
 		Logf("渠道 %s 测试连接失败: %v", ch.ID, err)
 		return errf("测试失败: %v", err)
+	}
+	Logf("渠道 %s 测试连接成功，%d 个模型", ch.ID, len(models))
+	writeJSON(w, map[string]any{"ok": true, "message": fmt.Sprintf("连接成功，发现 %d 个模型", len(models)), "models": models})
+	return nil
+}
+
+// channelPretest 在不写入配置的前提下测试一份渠道配置（POST /api/channels/test）。
+// 自定义模型面板里「先测后存」必须走这条路：用户填错 base_url 不该落下一个坏实例。
+// 编辑已有实例时前端只有脱敏 key，带 channel_id 才能把 "***" 字段回填成明文（W3-17）。
+func (s *Server) channelPretest(w http.ResponseWriter, r *http.Request) error {
+	if r.Method != http.MethodPost {
+		return errf("方法不支持")
+	}
+	var body struct {
+		PluginID  string         `json:"plugin_id"`
+		ChannelID string         `json:"channel_id"`
+		Config    map[string]any `json:"config"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		return err
+	}
+	pl := s.RT.Plugin(body.PluginID)
+	if pl == nil || pl.Met.Kind != "channel" {
+		return errf("渠道插件未安装: %s，请先到插件商店安装", body.PluginID)
+	}
+	cfg := body.Config
+	if old := s.Store.Channel(body.ChannelID); old != nil && old.PluginID == body.PluginID {
+		cfg = fillMaskedSecrets(cfg, old.Config)
+	}
+	models, err := s.probeModels(r.Context(), body.PluginID, cfg)
+	if err != nil {
+		Logf("配置预检失败（插件 %s）: %v", body.PluginID, err)
+		return errf("测试失败: %v", err)
+	}
+	writeJSON(w, map[string]any{"ok": true, "message": fmt.Sprintf("连接成功，发现 %d 个模型", len(models)), "models": models})
+	return nil
+}
+
+// probeModels 拉取插件模型列表并回填思考档位缓存（面板随后读 /core/fees 不必再 spawn 一轮进程）。
+func (s *Server) probeModels(ctx context.Context, pluginID string, cfg map[string]any) ([]meta.ModelInfo, error) {
+	res, err := s.RT.Call(ctx, pluginID, "models.list", map[string]any{"config": cfg})
+	if err != nil {
+		return nil, err
 	}
 	var payload struct {
 		Models []meta.ModelInfo `json:"models"`
 	}
 	_ = json.Unmarshal(res.Result, &payload)
-	// 顺手回填档位缓存（面板随后读 /core/fees 就不必再 spawn 一轮插件进程）
-	cacheModelInfos(ch.PluginID, payload.Models)
-	Logf("渠道 %s 测试连接成功，%d 个模型", ch.ID, len(payload.Models))
-	writeJSON(w, map[string]any{"ok": true, "message": fmt.Sprintf("连接成功，发现 %d 个模型", len(payload.Models)), "models": payload.Models})
+	cacheModelInfos(pluginID, payload.Models)
+	return payload.Models, nil
+}
+
+// fillMaskedSecrets 把前端回传的 "***xxx" 字段换成存量明文（前端永远拿不到明文）。
+func fillMaskedSecrets(newCfg, oldCfg map[string]any) map[string]any {
+	out := make(map[string]any, len(newCfg))
+	for k, v := range newCfg {
+		if sv, ok := v.(string); ok && strings.HasPrefix(sv, "***") {
+			if old, ok := oldCfg[k].(string); ok {
+				out[k] = old
+				continue
+			}
+		}
+		out[k] = v
+	}
+	return out
+}
+
+// checkChannelID 校验渠道实例 ID。ID 就是模型命名空间前缀（路由第①级按 "<id>/" 命中），
+// 所以除了字符合法性，还得避开已被其他插件声明的前缀，否则自建实例会把内建渠道的模型抢走。
+func (s *Server) checkChannelID(id string) error {
+	if !channelIDPattern.MatchString(id) {
+		return errf("渠道标识非法（字母/数字/下划线/短横线，首尾不为短横线，长度 1~32）: %s", id)
+	}
+	if id == "models_refresh_all" || id == "test" || id == "detail" || id == "secret" {
+		return errf("渠道标识为保留字: %s", id)
+	}
+	cfg := s.Store.Get()
+	for _, x := range cfg.Channels {
+		if x.ID == id {
+			return errf("渠道 ID 已存在: %s", id)
+		}
+	}
+	for _, p := range s.RT.Plugins() {
+		if p.Met.Kind != "channel" {
+			continue
+		}
+		for _, d := range p.Met.DefaultChannels {
+			if d.ID == id {
+				return errf("渠道标识与插件 %s 声明的渠道同名: %s", p.Met.ID, id)
+			}
+		}
+	}
+	return nil
+}
+
+// channelIDPattern 与旧版渠道编辑器同口径（字母开头，字母/数字/_/-，≤ 32）。
+var channelIDPattern = regexp.MustCompile(`^[A-Za-z0-9](?:[A-Za-z0-9_-]{0,30}[A-Za-z0-9])?$`)
+
+// checkChannelIDForRename 改名专用校验：字面/保留字/与其它渠道或插件声明冲突，但排除自己。
+// 不能复用 checkChannelID 的原样实现——它把「当前渠道自己的 ID」也当成冲突。
+func (s *Server) checkChannelIDForRename(newID, selfID string) error {
+	if !channelIDPattern.MatchString(newID) {
+		return errf("渠道标识非法（字母/数字/下划线/短横线，首尾不为短横线，长度 1~32）: %s", newID)
+	}
+	if newID == "models_refresh_all" || newID == "test" || newID == "detail" || newID == "secret" {
+		return errf("渠道标识为保留字: %s", newID)
+	}
+	for _, x := range s.Store.Get().Channels {
+		if x.ID == newID && x.ID != selfID {
+			return errf("渠道 ID 已存在: %s", newID)
+		}
+	}
+	for _, p := range s.RT.Plugins() {
+		if p.Met.Kind != "channel" {
+			continue
+		}
+		for _, d := range p.Met.DefaultChannels {
+			// 插件声明的内建渠道 ID 不得被自建实例占用（W3-24 记错区教训）；
+			// 但若自己就是那个内建渠道（默认渠道实例），改别名不算冲突。
+			if d.ID == newID && selfID != d.ID {
+				return errf("渠道标识与插件 %s 声明的渠道同名: %s", p.Met.ID, newID)
+			}
+		}
+	}
 	return nil
 }
 
@@ -568,6 +760,10 @@ func (s *Server) accountOne(w http.ResponseWriter, r *http.Request) error {
 	}
 	if acct == nil {
 		return errf("账号不存在: %s", uid)
+	}
+	ch := s.Store.Channel(acct.ChannelID)
+	if ch == nil || s.RT.Plugin(ch.PluginID) == nil {
+		return errf("账号所属渠道插件未安装")
 	}
 	// 插件 ID 需从账号所属渠道反查（Call 收的是插件 ID，不是渠道 ID）
 	pluginID := acct.ChannelID
@@ -1019,6 +1215,28 @@ func (s *Server) requestLogs(w http.ResponseWriter, r *http.Request) error {
 		out = append(out, reqLogBuf[i])
 	}
 	reqLogMu.Unlock()
+	writeJSON(w, out)
+	return nil
+}
+
+// failLogs 返回最近失败记录（W3-46）：来源是 stat 按日落盘的 `fail/YYYYMMDD.jsonl`，
+// 重启后仍在（内存环形 reqLogBuf 只能看到本次进程的）。
+//
+// 与 requestLogs 的分工：requestLogs 连成功也记、只保留最近 50 条供直观排查；
+// failLogs 只记失败，且**包含无法归渠道**的请求（行内 channel_id 可为空），
+// 按 keepDays 落盘保留。所有失败都进这一个文件，不按渠道再拆（归属不确定的东西
+// 不该先按确定的键分类）。
+func (s *Server) failLogs(w http.ResponseWriter, r *http.Request) error {
+	days := atoiDefault(r.URL.Query().Get("days"), 1)
+	limit := atoiDefault(r.URL.Query().Get("limit"), 50)
+	recs := s.Stat.QueryFails(days, limit)
+	out := make([]map[string]any, 0, len(recs))
+	for _, x := range recs {
+		out = append(out, map[string]any{
+			"ts": x.TS, "model": x.Model, "channel": x.ChannelID, "account": x.AccountUID,
+			"err_kind": x.ErrKind, "message": x.Message, "time_ms": x.TimeMs, "first_token_ms": x.FirstTokenMs,
+		})
+	}
 	writeJSON(w, out)
 	return nil
 }

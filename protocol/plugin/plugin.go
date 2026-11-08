@@ -262,7 +262,12 @@ type Call struct {
 }
 
 // Start 启动插件进程并异步发起 invoke（不等结果）。
-// cb.OnID 会在 invoke 发出前被调用（给出本次调用 id）；双向流可用 call.ID() 取。
+// cb.OnID 在 invoke 帧**写出之后**被调用（给出本次调用 id）；双向流可用 call.ID() 取。
+//
+// 这个顺序是契约：调用方拿到 id 就会开始回灌 push 帧，若 OnID 先于 send 触发，push 可能抢在
+// invoke 之前到达服务端，而服务端按 id 查在途流（rpc/server.go 的 s.live）查不到：
+// stdio 形态**静默丢帧**，call 形态直接报“一次性模式期望 op=invoke，收到 push”。
+// （实测：8 路并发下事件数 294/287/296/298/299，期望 300。）
 func Start(ctx context.Context, spec Spec, method string, params any, cb *rpc.Callback) (*Call, error) {
 	if spec.Exe == "" {
 		return nil, fmt.Errorf("插件可执行文件路径为空")

@@ -45,8 +45,8 @@ func TestUninstallKeepsDataDirs(t *testing.T) {
 	}
 }
 
-// purge=true 才连数据一起删（用户在面板显式确认「连凭据一起删」）。
-func TestUninstallPurge(t *testing.T) {
+// 即使旧调用传了 purge=true，卸载仍不得删除旧布局中的凭据。
+func TestUninstallPurgeKeepsData(t *testing.T) {
 	root := t.TempDir()
 	id := "glm"
 	dir := filepath.Join(root, id)
@@ -57,10 +57,10 @@ func TestUninstallPurge(t *testing.T) {
 		t.Fatal(err)
 	}
 	if err := New(root).Uninstall(id, true); err != nil {
-		t.Fatalf("purge 卸载失败: %v", err)
+		t.Fatalf("卸载失败: %v", err)
 	}
-	if _, err := os.Stat(dir); !os.IsNotExist(err) {
-		t.Errorf("purge 应删整个目录，err=%v", err)
+	if _, err := os.Stat(filepath.Join(dir, "auths", "a.json")); err != nil {
+		t.Errorf("旧布局凭据应保留: %v", err)
 	}
 }
 
@@ -68,5 +68,48 @@ func TestUninstallPurge(t *testing.T) {
 func TestUninstallMissing(t *testing.T) {
 	if err := New(t.TempDir()).Uninstall("nope", false); err != nil {
 		t.Errorf("幂等卸载应无错: %v", err)
+	}
+}
+
+// 新布局（数据不住安装树）下卸载要把目录本身删掉，否则 List 仍会列出这个空壳。
+func TestUninstallRemovesDirNewLayout(t *testing.T) {
+	root := t.TempDir()
+	dir := filepath.Join(root, "loopguard", "1.0.0")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for rel, body := range map[string]string{
+		"current":                  "1.0.0",
+		"1.0.0/loopguard-hook.exe": "x",
+		"1.0.0/manifest.json":      `{"id":"loopguard","kind":"hook","version":"1.0.0"}`,
+	} {
+		p := filepath.Join(root, "loopguard", rel)
+		if err := os.WriteFile(p, []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	m := New(root)
+	if l, _ := m.List(); len(l) != 1 {
+		t.Fatalf("装完应列出 1 个，实际 %d", len(l))
+	}
+	if err := m.Uninstall("loopguard", false); err != nil {
+		t.Fatalf("卸载失败: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(root, "loopguard")); !os.IsNotExist(err) {
+		t.Errorf("新布局下安装目录应整个删除，err=%v", err)
+	}
+	if l, _ := m.List(); len(l) != 0 {
+		t.Errorf("卸载后不应再列出，实际 %+v", l)
+	}
+}
+
+// 没有 current 的目录不是已装插件（卸载残留空壳 / 半途失败的临时目录）。
+func TestListSkipsDirWithoutCurrent(t *testing.T) {
+	root := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(root, "broken", "1.0.0"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if l, err := New(root).List(); err != nil || len(l) != 0 {
+		t.Fatalf("无 current 的目录不应列出: %+v err=%v", l, err)
 	}
 }

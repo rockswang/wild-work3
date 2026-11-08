@@ -1,6 +1,6 @@
 // custom-api-ext：自定义 OpenAI 兼容 API 渠道插件（渠道插件样板，W3-20/21）。
 //
-// 命令行形态（契约见 docs/PLUGIN_CLI.md）：
+// 命令行形态（契约见 protocol/docs/PLUGIN_CLI.md）：
 //
 //	custom-api-ext.exe <command> --data <dir> [--switch value ...]
 //

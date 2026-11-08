@@ -27,11 +27,15 @@ const PluginID = "custom-api"
 // Manifest 本插件元数据。
 func Manifest() meta.Manifest {
 	return meta.Manifest{
-		ID:       PluginID,
-		Name:     "Custom API",
-		Version:  "1.0.0",
-		Kind:     "channel",
-		Protocol: meta.ProtocolRng{Min: 1, Max: 1},
+		ID: PluginID,
+		// Name 即面板「＋ 自定义模型」按钮文案（账号页按插件 name 渲染入口），沿用旧版叫法。
+		Name:    "自定义模型",
+		Version: "1.0.0",
+		Kind:    "channel",
+		// 与旧版一致：Provider（渠道标识 + base_url + api_key）全部由用户自建，可任意多个，
+		// 实例 ID 即模型命名空间前缀；因此不预置空配置占位渠道（面板「自定义模型」列表增删改）。
+		MultiChannels: true,
+		Protocol:      meta.ProtocolRng{Min: 1, Max: 1},
 		Execution: meta.Execution{
 			// call：core 每个调用起一个进程（控制面查模型、会话面 chat.generate）
 			Control:            plugin.ModeCall,

@@ -6,7 +6,7 @@ import (
 	"strings"
 )
 
-// 数据目录子目录名（契约，见 docs/PLUGIN_CLI.md §5）。
+// 数据目录子目录名（契约，见 protocol/docs/PLUGIN_CLI.md §5）。
 const (
 	SubAuths = "auths"  // 凭据
 	SubLogs  = "logs"   // 日志
@@ -35,7 +35,7 @@ func ResolveData(flagValue string) string {
 // AuthPath 返回凭据文件路径：<data>/auths/<name>.json（name 不带后缀）。
 //
 // name 即「凭据标识」= 旧版的凭据文件名去后缀（如 workbuddyai-wb-uid-001），
-// 它同时是 core 侧的 account_uid（见 docs/PLUGIN_CLI.md §5.2）。
+// 它同时是 core 侧的 account_uid（见 protocol/docs/PLUGIN_CLI.md §5.2）。
 func AuthPath(data, name string) string {
 	name = strings.TrimSuffix(strings.TrimSpace(name), ".json")
 	if name == "" {

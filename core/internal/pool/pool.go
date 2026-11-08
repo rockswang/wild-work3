@@ -529,3 +529,44 @@ func Status(e Entry, now time.Time) string {
 	}
 	return "ok"
 }
+
+// RenameChannel 渠道实例改名时整体迁移池内归属（W3-45）：条目 UID、ChannelID 与粘性记录。
+//
+// 必须在**改配置之前或之后立刻**调用：池里的账号主键与配置里的 UID 必须始终一致，
+// 否则重启后 SyncAccounts 加载配置能对上、而本进程内存里的旧 UID 会被当成「配置里已
+// 不存在」而清掉，导致冷却状态丢失、积分账号变幽灵。
+//
+// 池状态会被持久化（persist.go），故这里改完即落盘：崩溃后恢复到新键，不会留半迁移状态。
+func (p *Pool) RenameChannel(oldID, newID string) {
+	if oldID == "" || newID == "" || oldID == newID {
+		return
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	next := make(map[string]*Entry, len(p.entries))
+	for uid, e := range p.entries {
+		if e.ChannelID == oldID {
+			e.ChannelID = newID
+			uid = renamingUID(uid, oldID, newID)
+			e.UID = uid // Entry.UID 是独立字段，不跟着改会让 List/Pick 返回旧主键（冷却归错人）
+		}
+		next[uid] = e
+	}
+	p.entries = next
+	if st := p.sticky[oldID]; st != nil {
+		delete(p.sticky, oldID)
+		p.sticky[newID] = st
+	}
+	p.saveLocked()
+}
+
+// renamingUID 账号主键迁移：虚拟账号 UID 恰为渠道 ID，其余形如 `<remoteUID>@<channelID>`。
+func renamingUID(uid, oldID, newID string) string {
+	if uid == oldID {
+		return newID
+	}
+	if len(uid) > len(oldID)+1 && uid[len(uid)-len(oldID)-1] == '@' && uid[len(uid)-len(oldID):] == oldID {
+		return uid[:len(uid)-len(oldID)] + newID
+	}
+	return uid
+}

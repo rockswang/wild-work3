@@ -109,6 +109,10 @@ func (a *application) init() error {
 	for _, pl := range rt.Plugins() {
 		a.log.Infof("已加载插件: %s v%s (%s) exe=%s", pl.Met.ID, pl.Met.Version, pl.Met.Kind, pl.Exe)
 	}
+	// 必须先补渠道再启动 syncAccounts，否则首次安装的凭据没有渠道可供扫描。
+	if err := seedDefaultChannels(st, rt); err != nil {
+		return fmt.Errorf("补建插件默认渠道失败: %w", err)
+	}
 	router := &route.Router{Store: st, Pool: p, RT: rt}
 	router.Logf = a.log.Infof
 	// 规则引擎（Pass B）：channel 作用域规则在 core 侧每个候选渠道调用前施加。
@@ -156,6 +160,61 @@ func (a *application) init() error {
 	a.srv = &api.Server{Store: st, Pool: p, RT: rt, Stat: led, Router: router,
 		Ver: map[string]string{"core": coreVersion, "ipc": "1"}}
 	return nil
+}
+
+// seedDefaultChannels 只补缺失的实例 ID；已有渠道（包括用户改名、禁用和自定义配置）原样保留。
+//
+// 「已存在」还要看 DefaultID 印记（W3-45）：用户把内建渠道改名后，配置里不再有 def.ID，
+// 若只按 ID 去重就会重建一份，同一个上游凭空多出一个实例。首次补建时把 def.ID 写进 DefaultID，
+// 之后无论怎么改名都能认出来。
+func seedDefaultChannels(st *config.Store, rt *runtime.Manager) error {
+	return st.Update(func(c *config.Config) error {
+		seen := make(map[string]bool, len(c.Channels))
+		seeded := make(map[string]bool, len(c.Channels)) // 插件已预置过的 default 标识
+		for _, ch := range c.Channels {
+			seen[ch.ID] = true
+			if ch.DefaultID != "" {
+				seeded[ch.PluginID+"\x00"+ch.DefaultID] = true
+			}
+		}
+		// 回填印记：安装树摆盘/旧版配置里的内建渠道没有 DefaultID，
+		// 而「ID 恰好等于某插件声明的 def.ID」就是尚未改名的铁证，可在启动时就补上。
+		for _, pl := range rt.Plugins() {
+			for _, def := range pl.Met.DefaultChannels {
+				id := strings.TrimSpace(def.ID)
+				if id == "" || seeded[pl.Met.ID+"\x00"+id] {
+					continue
+				}
+				for _, ch := range c.Channels {
+					if ch.ID == id && ch.PluginID == pl.Met.ID {
+						ch.DefaultID = id
+						seeded[pl.Met.ID+"\x00"+id] = true
+					}
+				}
+			}
+		}
+		for _, pl := range rt.Plugins() {
+			if pl.Met.Kind != "channel" {
+				continue
+			}
+			for _, def := range pl.Met.DefaultChannels {
+				id := strings.TrimSpace(def.ID)
+				if id == "" || seen[id] {
+					continue
+				}
+				if seeded[pl.Met.ID+"\x00"+id] {
+					continue // 该内建实例已被用户改名为别的 ID，不重建
+				}
+				seen[id] = true
+				seeded[pl.Met.ID+"\x00"+id] = true
+				c.Channels = append(c.Channels, &config.ChannelConfig{
+					ID: id, PluginID: pl.Met.ID, DisplayName: def.Name,
+					Enabled: true, Config: def.Config, DefaultID: id,
+				})
+			}
+		}
+		return nil
+	})
 }
 
 // listenAddr 实际监听地址：命令行 --listen 覆盖配置值。
@@ -345,6 +404,15 @@ func (a *application) handleIPCGenerate(ctx context.Context, raw jsonl.RawMessag
 		ErrKind: rec.ErrKind, Prompt: rec.PromptTokens, Completion: rec.CompletionTokens,
 		Total: rec.TotalTokens, TimeMs: rec.TimeMs, FirstMs: rec.FirstTokenMs,
 	})
+	if !rec.OK {
+		// 失败落盘（W3-46）：内存环形重启即清，而「昨天到底怎么挂的」只能在磁盘上找。
+		// 明细进 usage 流水已够，这里额外记 ErrKind 与截断后的上游摘要，便于单表排查。
+		a.led.AppendFail(stat.FailRecord{
+			RequestID: rec.RequestID, ConversationID: rec.ConversationID,
+			ChannelID: rec.ChannelID, AccountUID: rec.AccountUID, Model: rec.Model,
+			ErrKind: rec.ErrKind, Message: failSummary(err), TimeMs: rec.TimeMs, FirstTokenMs: rec.FirstTokenMs,
+		})
+	}
 
 	if err != nil {
 		kind := errkind.Server
@@ -374,8 +442,9 @@ func (a *application) handleIPCGenerate(ctx context.Context, raw jsonl.RawMessag
 	return mustJSON(out), nil
 }
 
-// stopPlugins 无需做任何事：渠道插件无常驻进程（W3-20），每个调用进程都在自己的
-// 调用结束时被回收（见 runtime.call 的 plugin.RunOnce）。保留此方法是为将来拦截器常驻进程留位。
+// stopPlugins 无需做任何事：渠道插件与拦截器插件都无常驻进程（W3-20 / W3-25），
+// 每个调用进程都在自己的调用结束时被回收（渠道见 runtime.call 的 plugin.RunOnce，
+// 拦截器见 runtime.startHook 的 c.Wait + defer c.Close）。保留此方法只为对称（与 startPlugins 配对）。
 func (a *application) stopPlugins() {}
 
 type handlerFunc func(name string, data json.RawMessage) error
@@ -405,6 +474,15 @@ func mustJSON(v any) jsonl.RawMessage {
 // cleanErrMsg 取错误原始消息（RPCError.Error() 会带 "[kind]scope: " 前缀，转发出错时会重复拼接）。
 func cleanErrMsg(err error) string {
 	return rpc.MessageOf(err)
+}
+
+// failSummary 失败摘要（只用于落盘排查）：nil 错误返回空串，其余取裸消息。
+// 不落凭据——上游错误体里即使回显 key，也会在 core 的 redact 环节被遮（§9 红线）。
+func failSummary(err error) string {
+	if err == nil {
+		return ""
+	}
+	return cleanErrMsg(err)
 }
 
 func scopeOf(k errkind.Kind) errkind.Scope {

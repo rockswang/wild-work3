@@ -76,10 +76,12 @@ type PluginView struct {
 	Latest       string   `json:"latest"`
 	Capabilities []string `json:"capabilities"`
 	Author       string   `json:"author"`
-	// Icon/Color/ConfigSchema 供「添加渠道」向导动态渲染（W3-06）
+	// Icon/Color/ConfigSchema 供渠道配置表单动态渲染（W3-06）
 	Icon         string          `json:"icon,omitempty"`
 	Color        string          `json:"color,omitempty"`
 	ConfigSchema json.RawMessage `json:"config_schema,omitempty"`
+	// MultiChannels=true：渠道实例由用户自建、可任意多个，面板只出一个入口按钮 + 实例列表（W3-44）
+	MultiChannels bool `json:"multi_channels,omitempty"`
 }
 
 // FeeModel 费率条目；未上报为 null（不臆造）。
@@ -110,6 +112,9 @@ func (s *Server) channelsView() []ChannelView {
 	now := time.Now()
 	out := make([]ChannelView, 0, len(cfg.Channels))
 	for _, ch := range cfg.Channels {
+		if s.RT.Plugin(ch.PluginID) == nil {
+			continue // 卸载后只隐藏视图，持久化配置和账号不动
+		}
 		v := ChannelView{
 			ChannelID: ch.ID, PluginID: ch.PluginID, DisplayName: ch.DisplayName,
 			Enabled: ch.Enabled, Models: len(ch.Models), Healthy: true,
@@ -163,6 +168,10 @@ func (s *Server) accountsView(channelFilter string) []AccountView {
 	}
 	out := make([]AccountView, 0, len(cfg.Accounts))
 	for _, a := range cfg.Accounts {
+		ch := s.Store.Channel(a.ChannelID)
+		if ch == nil || s.RT.Plugin(ch.PluginID) == nil {
+			continue
+		}
 		if channelFilter != "" && a.ChannelID != channelFilter {
 			continue
 		}
@@ -217,6 +226,8 @@ func (s *Server) pluginViews() []PluginView {
 			Capabilities: append(append([]string{}, p.Met.Capabilities.Control...), p.Met.Capabilities.Conversation...),
 			Author:       "wild-work3",
 			Icon:         p.Met.Icon, Color: p.Met.Color,
+			// multi_channels 直接取自 manifest：前端据此决定「实例列表」还是「单实例配置表单」
+			MultiChannels: p.Met.MultiChannels,
 		}
 		// 附 config.schema（「添加渠道」向导据此动态生成表单）
 		if pv.Capabilities != nil {
@@ -236,6 +247,9 @@ func (s *Server) feesView(ctx context.Context) []FeeChannel {
 	cfg := s.Store.Get()
 	out := make([]FeeChannel, 0, len(cfg.Channels))
 	for _, ch := range cfg.Channels {
+		if s.RT.Plugin(ch.PluginID) == nil {
+			continue
+		}
 		models := make([]FeeModel, 0, len(ch.Models))
 		// 档位明细优先读缓存，未命中现拉一次（失败退化为「未声明」，不影响费率表渲染）
 		infos := s.modelInfosOfChannel(ctx, ch)
@@ -430,6 +444,10 @@ func (s *Server) statsView() map[string]any {
 	var acctToday, acctTomorrow int
 	tomorrow := now.AddDate(0, 0, 1).Format("2006-01-02")
 	for _, e := range s.Pool.List() {
+		ch := s.Store.Channel(e.ChannelID)
+		if ch == nil || s.RT.Plugin(ch.PluginID) == nil {
+			continue
+		}
 		if e.Credits != nil && *e.Credits > 0 {
 			totalCredits += *e.Credits
 		}
@@ -465,14 +483,16 @@ func (s *Server) statsView() map[string]any {
 	var chOrder []string
 	chNames := map[string]string{}
 	for _, ch := range cfg.Channels {
-		chNames[ch.ID] = orDefault(ch.DisplayName, ch.ID)
+		if s.RT.Plugin(ch.PluginID) != nil {
+			chNames[ch.ID] = orDefault(ch.DisplayName, ch.ID)
+		}
 	}
 	for _, x := range recs {
 		if len(x.TS) < 10 || x.TS[:10] != today {
 			continue
 		}
 		k := x.ChannelID
-		if k == "" {
+		if _, installed := chNames[k]; !installed {
 			continue
 		}
 		r := chMap[k]
@@ -521,12 +541,12 @@ func (s *Server) statsView() map[string]any {
 			warnings = append(warnings, a.UID+" 有额度今日到期")
 		}
 	}
-	if len(cfg.Channels) == 0 {
+	if len(chNames) == 0 {
 		warnings = append(warnings, "尚未添加任何渠道")
 	}
 
 	return map[string]any{
-		"accounts_total":          len(cfg.Accounts),
+		"accounts_total":          len(accts),
 		"accounts_expiring_today": expiring,
 		"accounts_stale":          stale,
 		"accounts_cooling":        cooling,

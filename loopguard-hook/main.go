@@ -26,7 +26,7 @@ import (
 func main() {
 	app := cli.NewApp("loopguard-hook", "思考链死循环（发癫）拦截器插件", "call")
 
-	// ---- 协议契约命令（docs/PLUGIN_CLI.md §2）----
+	// ---- 协议契约命令（protocol/docs/PLUGIN_CLI.md §2）----
 	pCallData := app.Cmd("call", "一次性：读一帧 invoke，写事件与 result 后退出（core 的调用方式）").Str("data", "", "插件数据目录（缺省 $WW3_DATA，否则可执行文件所在目录）")
 	pStdioData := app.Cmd("stdio", "常连：在 stdin/stdout 上跑 JSONL RPC 循环直到 EOF").Str("data", "", "插件数据目录")
 	pManifestOut := app.Cmd("manifest", "输出 manifest.json（打包插件目录用）").Str("out", "", "写入文件（缺省打印到 stdout）")

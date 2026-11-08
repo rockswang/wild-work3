@@ -2,7 +2,10 @@
 //
 // 运行形态（AGENTS §2-T / W3-20）：
 //   - 渠道插件：**无常驻**。每次调用 spawn 一个进程走 `call`，读完结果即回收。
-//   - 拦截器插件：每次对话都要用，由 core 按需拉起后常驻，走 `stdio` 反复 invoke。
+//   - 拦截器插件：同样**无常驻**（W3-25 修正 W3-20 早期措辞）——一次对话请求为链上每层各
+//     spawn 一个 `call` 进程，走双向流方法 `hook.stream` 服务整段流，请求结束即回收。
+//     实测依据见 temp/hook_resident_eval.md：spawn ≈7ms，且在流水线下与渠道 worker 并行启动、
+//     不在关键路径上；常驻反而要长期占 ~12MB/层并在并发下慢 1.15–1.22x。
 //
 // 为什么不做常驻渠道 daemon：控制面调用是低频离散的（查模型、刷 token、看余额），
 // 常驻要额外维护空闲回收、健康检查、插件升级后的一致性，收益不抵复杂度。代价是每次调用
@@ -602,10 +605,11 @@ type ChatOptions struct {
 // 返回 usage 与错误；正常结束时 err 为 nil。进程在 result 到达后立即回收，
 // 不维护 conversation_id ↔ 进程映射（W3-11）。
 //
-// 配置了拦截器链时（opts.Hooks 非空），渠道事件先进一个内部 channel，再由
-// RunHooks 以流水线方式反向穿过链尾→链头（见 hook.go 的包注释）。此时 OnEvent
-// 收到的是**链处理之后**的事件；链上某层命中并返回错误时，本方法返回该错误，
-// 调用方应把它作为终止事件发给下游（不补 [DONE]）。
+// 配置了拦截器链时（opts.Hooks 非空），渠道事件经一个小缓冲 queue **边到边**穿过链：
+// RunHooks 与渠道 worker 并行启动，事件反向穿过链尾→链头后写 OnEvent（见 hook.go 包注释）。
+// core 绝不缓存整段响应（AGENTS §2-E / §9 红线），因此 OnEvent 收到的是链处理之后的
+// **实时**事件；链上某层命中并返回错误时，本方法返回该错误（调用方应把它作为终止事件发给
+// 下游，不补 [DONE]），同时渠道 worker 被提前终止——上游不再白跑完整段生成。
 func (m *Manager) ChatStream(ctx context.Context, req *chat.GenerateRequest, opts ChatOptions) (*chat.Usage, error) {
 	m.mu.Lock()
 	_, ok := m.plugins[opts.PluginID]
@@ -617,21 +621,44 @@ func (m *Manager) ChatStream(ctx context.Context, req *chat.GenerateRequest, opt
 	// 并发配额由 m.call 内部统一 acquire/release（同一插件信号量），此处**不得重复 acquire**——
 	// 否则同一请求会占用两个配额，并发一旦超过 max_workers 就会互相饿死（实测 conc 6 时 30s 超时）。
 
-	// 有拦截器时：渠道事件先入队，等渠道跑完后再由 RunHooks 反向穿过链。
+	// 有拦截器时：hook 链与渠道 worker **并行**启动，事件边到边穿链（真流水线）。
+	//	queue 只是抹平抖动的小缓冲，不是收集桶——消费者从第一帧起就在抽，因此既不会把
+	//	首字延迟拖成整段生成时长，也不会因桶满而把反压一路堵回上游（旧实现两者都中）。
 	//	无拦截器时 sink 直接就是 OnEvent（不多一次跳转）。
 	useHooks := len(opts.Hooks) > 0
-	var queue chan HookEvent
+	var (
+		queue   chan HookEvent
+		up      *HookUpstream // 上游结果摘要：spawn 时未知，故不随 params 下发，只在 upstream.end 帧里给
+		stop    chan struct{} // 链提前退出时唤醒仍阻塞在 queue<- 的 sender
+		sendWG  sync.WaitGroup
+		hookErr chan error
+	)
 	emit := opts.OnEvent
 	if useHooks {
 		queue = make(chan HookEvent, 256)
+		up = &HookUpstream{}
+		stop = make(chan struct{})
+		hookErr = make(chan error, 1)
 		emit = func(name string, data json.RawMessage) error {
+			sendWG.Add(1)
+			defer sendWG.Done()
 			select {
 			case queue <- HookEvent{Name: name, Data: data}:
 				return nil
+			case <-stop:
+				return errHookGone // 链已收尾/已报错退出：让 rpc readLoop 立刻脱身，别堵死上游
 			case <-ctx.Done():
 				return ctx.Err()
 			}
 		}
+		// 下游最终落笔：直接写 OnEvent。hook 的产出已经在 RunHooks 内部按层路由。
+		//	stop 由本 goroutine 退出时关（而不是等渠道跑完）：链上任意一层报错就会立即从
+		//	RunHooks 返回，此时 queue 再没人抽，必须马上把仍阻塞在 queue<- 的 sender 踢醒——
+		//	否则渠道 worker 会把 256 帧缓冲写满后堵在 stdout 管道上，直到 ChatTimeout 才醒。
+		go func() {
+			defer close(stop)
+			hookErr <- m.RunHooks(ctx, opts.Hooks, req, up, queue, opts.OnEvent)
+		}()
 	}
 
 	var usage *chat.Usage
@@ -664,16 +691,23 @@ func (m *Manager) ChatStream(ctx context.Context, req *chat.GenerateRequest, opt
 	}
 	_, callErr := m.call(ctx, opts.ChannelID, opts.PluginID, "chat.generate", req, cb)
 
-	// 渠道事件已全部入队（或渠道失败）——关掉队列让 RunHooks 收尾。
+	// 渠道流已结束（或失败）——填摘要、封队列，让链注入 upstream.end 并逐层收尾。
 	if useHooks {
-		close(queue)
-		up := &HookUpstream{OK: callErr == nil && chanErr == nil}
+		// 摘要必须在 close(queue) 之前写完：RunHooks 是在 `for e := range src` 退出之后才读它，
+		// 而「close 先于 range 结束」构成 happens-before（Go 内存模型），故无需额外加锁。
+		up.OK = callErr == nil && chanErr == nil
 		if chanErr != nil {
 			up.Kind, up.Message = chanErr.kind, chanErr.msg
 		}
-		// 下游最终落笔：直接写 OnEvent。hook 的产出已经在 RunHooks 内部按层路由。
-		if err := m.RunHooks(ctx, opts.Hooks, req, up, queue, opts.OnEvent); err != nil {
-			return usage, err
+		// 顺序不可换：先等所有 sender 真的离开（stop 已由链退出时关闭，不会有人再阻塞），
+		// 最后才 close(queue)——否则就是 send on closed channel 打崩 core。
+		sendWG.Wait()
+		close(queue)
+		if err := <-hookErr; err != nil {
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				return usage, ctxErr // 取消/超时是真因：链上的“拒绝事件”只是它的后果，别让 route 误判成拦截器故障
+			}
+			return usage, err // 拦截器层错误优先于渠道层：它才是下游该看到的终止原因
 		}
 	}
 
@@ -697,6 +731,14 @@ func (m *Manager) callResultErr(msg jsonl.Msg) error {
 }
 
 type streamErr struct{ kind, msg string }
+
+// errHookGone 表示拦截器链已不再消费事件（正常收尾或已报错退出）。
+//
+// why：链一旦退出，queue 就没人抽了，而渠道 worker 可能还在往下吐帧。emit 必须立刻返回错误
+// 让 rpc readLoop 脱身（Invoke 随之返回 → 插件进程被回收 → 上游不再白跑），
+// 否则就是“hook 已报错、渠道还在 streaming”的无限阻塞。它只是一个内部信号：
+// ChatStream 总优先返回 hookErr（真正的终止原因），本错误不会冒到路由层。
+var errHookGone = errors.New("拦截器链已退出")
 
 func (e *streamErr) Error() string { return e.msg }
 

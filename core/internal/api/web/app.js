@@ -75,26 +75,60 @@ function esc(s) {
 }
 
 const CH_COLORS = {
-  wb: '#FF7A45', qoder: '#5B8FF9', trae: '#00B5A5', minimax: '#9254DE',
+  wb: '#FF7A45', wbai: '#5B8FF9', qoder: '#5B8FF9', qodercn: '#5B8FF9', qodercom: '#5B8FF9',
+  trae: '#00B5A5', traecode: '#00B5A5', minimax: '#9254DE',
   custom: '#52C41A', hook: '#FAAD14', lm: '#FAAD14',
 };
+const CH_CLASS = { workbuddy: 'wb', workbuddyai: 'wbai', traework: 'trae', 'custom-api': 'custom' };
 function chClass(id) {
   if (id === 'billion' || id.includes('hook')) return 'hook';
   const key = id.split('-')[0];
-  return key in CH_COLORS ? key : 'custom';
-}
-function avatar(channelId, name) {
-  const cls = chClass(channelId);
-  const color = CH_COLORS[cls] || CH_COLORS.custom;
-  const letter = (name || '?').slice(0, 1);
-  return `<span class="ch-avatar" style="background:${color}">${letter}</span>`;
-}
-function chName(id) { return state.channelNames[id] || id; }
-function chip(text, cls) {
-  return `<span class="chip ${cls || ''}">${text}</span>`;
+  return CH_CLASS[id] || CH_CLASS[key] || (key in CH_COLORS ? key : 'custom');
 }
 
-let state = { selectedChannel: 'all', days: 7, channelNames: {} };
+// 自定义模型（multi_channels 插件）的实例配色：按实例序号黄金角取色，
+// 多个 Provider 不会全共用一个绿（与旧版 customChannelColor 同口径，W3-44）。
+const GOLDEN_ANGLE = 137.508;
+const _chColorCache = {};
+function hslToHex(h, s, l) {
+  const f = (n) => {
+    const k = (n + h / 30) % 12;
+    const a = (s / 100) * Math.min(l / 100, 1 - l / 100);
+    const c = l / 100 - a * Math.max(-1, Math.min(k - 3, Math.min(9 - k, 1)));
+    return Math.round(c * 255).toString(16).padStart(2, '0');
+  };
+  return `#${f(0)}${f(8)}${f(4)}`;
+}
+function relLuminance(hex) {
+  const v = [1, 3, 5].map((i) => parseInt(hex.substr(i, 2), 16) / 255)
+    .map((c) => (c <= 0.03928 ? c / 12.92 : Math.pow((c + 0.055) / 1.055, 2.4)));
+  return 0.2126 * v[0] + 0.7152 * v[1] + 0.0722 * v[2];
+}
+function providerColor(id) {
+  const arr = state.providerIds;
+  const idx = arr.indexOf(id) < 0 ? arr.length : arr.indexOf(id);
+  const ck = `${id}#${idx}`;
+  if (_chColorCache[ck]) return _chColorCache[ck];
+  const hue = (idx * GOLDEN_ANGLE) % 360;
+  // 明度从 42% 逐级下压，直到白字对比 ≥ 4.5（黄/绿最亮，要压到 28% 左右）
+  let hex = hslToHex(hue, 78, 42);
+  for (let l = 42; l >= 22; l--) {
+    hex = hslToHex(hue, 78, l);
+    if (1.05 / (relLuminance(hex) + 0.05) >= 4.5) break;
+  }
+  return (_chColorCache[ck] = hex);
+}
+// 渠道展示名 / 自定义模型实例集 / 插件 config_schema，都在 loadChannelButtons() 里刷新。
+let state = { selectedChannel: 'all', days: 7, channelNames: {}, providerIds: [], pluginSchema: {} };
+
+// isProvider：该渠道实例属于某个「实例由用户自建」的插件（实例 ID 就是模型命名空间前缀）。
+function isProvider(id) { return state.providerIds.includes(id); }
+function chColor(id) { return isProvider(id) ? providerColor(id) : (CH_COLORS[chClass(id)] || CH_COLORS.custom); }
+
+function avatar(channelId, name) {
+  return `<span class="ch-avatar" style="background:${chColor(channelId)}">${(name || '?').slice(0, 1)}</span>`;
+}
+function chName(id) { return state.channelNames[id] || id; }
 
 // ---------- 顶栏 ----------
 // 监听地址/API Key/自启属 gateway（安全与生命周期）；渠道信息属 core。
@@ -113,7 +147,7 @@ async function loadTopbar() {
 function switchTab(name) {
   $$all('.mtab').forEach((b) => b.classList.toggle('active', b.dataset.mtab === name));
   $$all('.mtab-body').forEach((b) => b.classList.toggle('hidden', b.id !== 'mtab' + name[0].toUpperCase() + name.slice(1)));
-  if (name === 'channels') safe(loadChannels());
+  if (name === 'accounts') safe(loadChannelButtons());
   if (name === 'usage') safe(loadUsage());
   if (name === 'stats') safe(loadStats());
   if (name === 'fees') safe(loadFees());
@@ -127,17 +161,21 @@ let accounts = [];
 // 冷却中 / 已停用 / 无额度的账号，避免一堆死号占满面板。
 const SHOW_NA_KEY = 'ww3.acct-show-na';
 let showNa = localStorage.getItem(SHOW_NA_KEY) === '1';
-// 渠道显示顺序（与渠道 tab 一致：内置颜色表顺序）
-function chOrder(ch) { const i = Object.keys(CH_COLORS || {}).indexOf(chClass(ch)); return i < 0 ? 99 : i; }
+// 与旧版一致：渠道按展示名字节序排序，自定义模型（Provider 实例）始终放最后。
+function chOrder(a, b) {
+  const x = chName(a), y = chName(b);
+  // 沿用旧版 R142：UTF-8 字节顺序（ASCII 名先于中文），自定义模型固定最后。
+  return Number(isProvider(a)) - Number(isProvider(b)) || (x < y ? -1 : x > y ? 1 : 0);
+}
 
 function renderAccounts() {
   const list = $$('#acctList');
-  // 按渠道分组（旧版按 channel 字段分组展示）
+  // 按渠道分组（与旧版一致）
   const byCh = {};
   accounts.forEach((a) => (byCh[a.channel] = byCh[a.channel] || []).push(a));
   // 顶部信用汇总（始终统计全部账号，不受「显示不可用」影响）
   const cs = $$('#creditSummary');
-  const entries = Object.entries(byCh).sort((a, b) => chOrder(a[0]) - chOrder(b[0]) || a[0].localeCompare(b[0]));
+  const entries = Object.entries(byCh).sort((a, b) => chOrder(a[0], b[0]));
   if (entries.length === 0) { cs.classList.add('hidden'); }
   else {
     cs.classList.remove('hidden');
@@ -146,7 +184,7 @@ function renderAccounts() {
       const creditSum = accts.reduce((s, a) => s + (a.credits || 0), 0);
       const tokenSum = accts.filter((a) => a.unit === 'token').length;
       cs.insertAdjacentHTML('beforeend',
-        `<span class="cs-item"><b style="color:${CH_COLORS[chClass(ch)]}">${ch}</b><span class="cs-v">${fmt.yuan(creditSum)}</span></span>`);
+        `<span class="cs-item"><b style="color:${chColor(ch)}">${esc(chName(ch))}</b><span class="cs-v">${fmt.yuan(creditSum)}</span></span>`);
       if (tokenSum > 0) cs.insertAdjacentHTML('beforeend',
         `<span class="cs-item">token 渠道 ${tokenSum} 个</span>`);
     });
@@ -159,7 +197,7 @@ function renderAccounts() {
     $$('#acctEmpty').classList.remove('hidden');
     $$('#acctEmpty').textContent = hidden > 0
       ? `已隐藏 ${hidden} 个不可用账号（勾选「显示不可用账号」查看）`
-      : '还没有账号，点击「＋ 添加渠道」添加';
+      : '还没有账号，点击上方渠道按钮添加';
     list.innerHTML = '';
     return;
   }
@@ -167,8 +205,8 @@ function renderAccounts() {
   const visByCh = {};
   vis.forEach((a) => (visByCh[a.channel] = visByCh[a.channel] || []).push(a));
   list.innerHTML = Object.entries(visByCh)
-    .sort((a, b) => chOrder(a[0]) - chOrder(b[0]) || a[0].localeCompare(b[0]))
-    .map(([ch, accts]) => `<div class="ch-group"><b>${ch}</b><span>${accts.length} 个账号</span></div>` +
+    .sort((a, b) => chOrder(a[0], b[0]))
+    .map(([ch, accts]) => `<div class="ch-group"><b>${esc(chName(ch))}</b><span>${accts.length} 个账号</span></div>` +
       accts.map(accountCard).join('')).join('');
 }
 
@@ -201,6 +239,7 @@ function accountCard(a) {
 }
 async function loadAccounts() {
   accounts = await api('/core/state').then((s) => s.accounts);
+  await loadChannelButtons();
   renderAccounts();
 }
 $$('#acctList').addEventListener('click', async (e) => {
@@ -309,98 +348,237 @@ function createDetailOverlay() {
   return d;
 }
 
-// ---------- Tab: 渠道管理 ----------
-async function loadChannels() {
-  const channels = await api('/core/channels');
-  // 缓存 channel_id → 展示名，供用量页模型榜/统计页渠道表引用
-  state.channelNames = Object.fromEntries(channels.map((c) => [c.channel_id, c.display_name || c.channel_id]));
-  $$('#chInfo').innerHTML = `${channels.length} 个渠道 · 点击卡片操作`;
-  $$('#channelGrid').innerHTML = channels.map((c) => {
-    const caps = (c.capabilities || []).map((x) => `<span class="pl-caps">${x}</span>`).join(' ');
-    const badges = [];
-    if (c.kind === 'hook') badges.push(chip('Hook', 'hook'));
-    if (c.cooling) badges.push(chip('冷却', 'cooling'));
-    if (c.healthy && !c.cooling) badges.push(chip('健康'));
-    if (!c.enabled) badges.push(chip('已停用'));
-    return `
-      <div class="channel-card" data-cc="${chClass(c.channel_id)}">
-        <div class="ch-title">${avatar(c.channel_id, c.display_name)} ${c.display_name}</div>
-        <div class="ch-meta">${c.plugin_id} v${c.version} · ${c.models} 模型 · ${c.accounts} 账号</div>
-        <div class="acct-sub">${badges.join('')} <span>${c.credit_sum ? '余额 ' + c.credit_sum : ''}</span></div>
-        <div class="ch-actions">
-          <button class="btn small" data-ch="${c.channel_id}" data-act="toggle">${c.enabled ? '停用' : '启用'}</button>
-          <button class="btn small" data-ch="${c.channel_id}" data-act="test">测试</button>
-          <button class="btn small" data-ch="${c.channel_id}" data-act="models">模型</button>
-          <button class="btn small" data-ch="${c.channel_id}" data-act="edit">编辑</button>
-          ${(c.capabilities || []).includes('auth.begin') ? `<button class="btn small primary" data-ch="${c.channel_id}" data-act="login">登录</button>` : ''}
-        </div>
-        <div class="ch-caps">${caps}</div>
-      </div>`;
-  }).join('');
+// 渠道入口按钮：普通渠道一个按钮；声明 multi_channels 的插件（自定义模型）一个「实例列表」入口。
+// 渠道实例由插件自动声明/用户自建，core 不保留独立的渠道管理页（W3-43/W3-44）。
+let channelButtons = [];      // 普通渠道实例（已启用）
+let providerPlugins = [];     // 实例由用户自建的插件
+async function loadChannelButtons() {
+  const [chans, plugs] = await Promise.all([api('/core/channels'), api('/core/plugins')]);
+  providerPlugins = (plugs || []).filter((p) => p.installed && p.multi_channels && p.kind !== 'hook');
+  const multi = new Set(providerPlugins.map((p) => p.plugin_id));
+  // providerIds 含所有实例（含停用），按 ID 定序，保证配色/排序不随启用状态跳变
+  state.providerIds = chans.filter((c) => multi.has(c.plugin_id)).map((c) => c.channel_id).sort();
+  state.channelNames = Object.fromEntries(chans.map((c) => [c.channel_id, c.display_name || c.channel_id]));
+  state.pluginSchema = Object.fromEntries((plugs || []).map((p) => [p.plugin_id, p.config_schema || null]));
+  channelButtons = chans.filter((c) => !multi.has(c.plugin_id) && c.enabled);
+  const btns = channelButtons.slice().sort((a, b) => chOrder(a.channel_id, b.channel_id)).map((c) =>
+    `<button class="btn primary alt ${chClass(c.channel_id)}" data-add-channel="${esc(c.channel_id)}" title="${esc(c.display_name || c.channel_id)}">＋ ${esc(c.display_name || c.channel_id)}</button>`);
+  // 旧版把「自定义模型」钉在最末：一个插件一个入口，点开是 Provider 列表
+  btns.push(...providerPlugins.map((p) =>
+    `<button class="btn primary alt custom" data-provider-panel="${esc(p.plugin_id)}" title="${esc(p.description || p.plugin_id)}">＋ ${esc(p.name || p.plugin_id)}</button>`));
+  $$('#accountAddButtons').innerHTML = btns.join('') || '<span class="ov-note">尚未安装渠道插件，请前往「插件与更新」</span>';
 }
-$$('#channelGrid').addEventListener('click', async (e) => {
-  const btn = e.target.closest('[data-act]');
+$$('#accountAddButtons').addEventListener('click', async (e) => {
+  const entry = e.target.closest('[data-provider-panel]');
+  if (entry) { safe(openCustomModels(entry.dataset.providerPanel)); return; }
+  const btn = e.target.closest('[data-add-channel]');
   if (!btn) return;
-  const { ch, act } = btn.dataset;
-  try {
-    if (act === 'toggle') { await api('/core/channels/' + ch + '/toggle', { method: 'POST' }); loadChannels(); return; }
-    if (act === 'test') { const r = await api('/core/channels/' + ch + '/test'); toast(r.message || '连接成功', 'ok'); return; }
-    if (act === 'models') {
-      const m = await api('/core/channels/' + ch + '/models');
-      await infoBox('模型列表 — ' + ch, m.length
-        ? `<div class="ov-info" style="max-height:52vh;overflow:auto">${m.map((x) => `<div>${x}</div>`).join('')}</div>`
-        : '<div class="ov-note">暂无模型。可在下方直接刷新。</div>');
-    }
-    if (act === 'edit') { openChannelWizard(ch); }
-    if (act === 'login') { openLoginWizard(ch); }
-  } catch (err) { toast('失败：' + err.message, 'err'); }
+  const id = btn.dataset.addChannel;
+  const ch = channelButtons.find((c) => c.channel_id === id);
+  if ((ch?.capabilities || []).includes('auth.begin')) safe(openLoginWizard(id));
+  else if (state.pluginSchema?.[ch?.plugin_id]) safe(openChannelWizard(id));   // 无登录但要密钥/基址的渠道走配置表单
+  else toast('该渠道无需登录，可直接使用', 'ok');
 });
 
-// ---------- 添加渠道 wizard（由已安装插件 + config.schema 动态生成，W3-06） ----------
+// ---------- Provider 列表（旧版 #customModelsOverlay 的等价物：一插件 N 实例，ID 即命名空间前缀） ----------
+const cmOverlay = $$('#customModelsOverlay');
+const peOverlay = $$('#providerEditor');
+let cmPlugin = null;        // 当前管理的插件（name/config_schema）
+let cmRows = [];            // 其实例详情（含脱敏 config 与 models）
+let peEditing = null;       // 编辑中的渠道 ID；null=新增
+let peModels = [];          // 「测试连接」带回来的模型清单，保存时一并下发
+
+async function openCustomModels(pluginID) {
+  const plugs = await api('/core/plugins');
+  cmPlugin = (plugs || []).find((p) => p.plugin_id === pluginID);
+  if (!cmPlugin) throw new Error('插件未安装：' + pluginID);
+  $$('#cmTitle').textContent = cmPlugin.name || pluginID;
+  await reloadProviderRows();
+  cmOverlay.classList.remove('hidden');
+}
+
+async function reloadProviderRows() {
+  const chans = await api('/core/channels');
+  const own = (chans || []).filter((c) => c.plugin_id === cmPlugin.plugin_id);
+  // 列表要显示基址与模型数，得逐实例取详情（实例数个位，且 GET 详情不会 spawn 插件进程）
+  cmRows = await Promise.all(own.map((c) => api('/core/channels/' + encodeURIComponent(c.channel_id))
+    .then((d) => Object.assign({}, c, d)).catch(() => ({ ...c, config: {}, models: [] }))));
+  cmRows.sort((a, b) => (a.channel_id < b.channel_id ? -1 : a.channel_id > b.channel_id ? 1 : 0));
+  renderProviderRows();
+}
+
+function renderProviderRows() {
+  const list = $$('#cmList');
+  if (!cmRows.length) { list.innerHTML = '<div class="cm-empty">还没有 Provider，点「＋ 新增 Provider」接入任意兼容端点。</div>'; return; }
+  list.innerHTML = cmRows.map((r) => {
+    const cfg = r.config || {}, models = r.models || [];
+    return `<div class="cm-row">
+      <span class="cm-dot" style="background:${chColor(r.channel_id)}"></span>
+      <div class="cm-main"><b>${esc(r.display_name || r.channel_id)}</b><span class="cm-id">${esc(r.channel_id)}/</span></div>
+      <span class="cm-url" title="${esc(cfg.base_url || '')}">${esc(cfg.base_url || '未配置基址')}</span>
+      <span class="cm-meta">${models.length} 模型 · ${r.enabled ? '启用' : '停用'}</span>
+      <span class="cm-ops">
+        <button class="btn small" data-pe-edit="${esc(r.channel_id)}">编辑</button>
+        <button class="btn small danger" data-pe-del="${esc(r.channel_id)}">删除</button>
+      </span>
+    </div>`;
+  }).join('');
+}
+
+function peMsg(text, kind) {
+  const el = $$('#peMsg');
+  el.textContent = text;
+  el.className = 'ov-note' + (kind ? ' ' + kind : '');
+}
+
+// 密钥明文只在用户**显式点击**时向后端取（W3-45：ww 也当凭据管理器用）。
+// 明文不缓存、不回填 input.value 之外的地方，日志里也不留（core 侧审计只记字段名）。
+function revealSecret(btn) {
+  const key = btn.dataset.reveal;
+  safe((async () => {
+    const res = await api('/core/channels/' + encodeURIComponent(peEditing) + '/secret?key=' + encodeURIComponent(key));
+    const input = $$all('#peSchema [data-key]').find((el) => el.dataset.key === key);
+    if (!input) throw new Error('表单里没有字段 ' + key);
+    input.value = res.value;
+    input.dataset.revealed = '1';   // 标记为明文，复制/关闭前不重新脱敏
+    btn.textContent = '已显示';
+    btn.disabled = true;
+    peMsg(`已显示 ${key} 明文（仅本页内存，不会写入日志）`, 'ok');
+  })());
+}
+
+function openProviderEditor(channelID) {
+  peEditing = channelID || null;
+  peModels = [];
+  const row = channelID ? cmRows.find((r) => r.channel_id === channelID) : null;
+  $$('#peTitle').textContent = channelID ? '编辑 Provider：' + channelID : '新增 Provider';
+  $$('#peID').value = channelID || '';
+  // 标识即模型前缀；改名会迁移账号/池/账本/规则（W3-45），允许但不是零成本，故显式提示
+  $$('#peID').disabled = false;
+  $$('#peID').title = channelID ? '改名会同步迁移该渠道的账号、冷却状态、用量账本与渠道级规则' : '';
+  $$('#peName').value = row ? row.display_name || '' : '';
+  $$('#peSchema').innerHTML = cmPlugin?.config_schema
+    ? schemaForm(cmPlugin.config_schema, (row && row.config) || {}, 'pe_', channelID ? cmPlugin.plugin_id : '')
+    : '<div class="ov-tip">该插件未提供 config.schema</div>';
+  peMsg('建议先「测试连接」：连通后会自动导入上游模型清单。');
+  peOverlay.classList.remove('hidden');
+  $$('#peID').focus();
+}
+
+async function deleteProvider(id) {
+  if (!(await confirmBox('删除 Provider', `删除 <b>${esc(id)}</b> 及其账号？凭据与用量流水保留，随时可重建同名 Provider。`))) return;
+  try {
+    await api('/core/channels/' + encodeURIComponent(id), { method: 'DELETE' });
+    toast('已删除 ' + id, 'ok');
+    await Promise.all([reloadProviderRows(), loadAccounts()]);
+  } catch (err) { toast('删除失败：' + err.message, 'err'); }
+}
+
+$$('#peSchema').addEventListener('click', (e) => {
+  const btn = e.target.closest('[data-reveal]');
+  if (btn) { safe(revealSecret(btn)); return; }
+});
+
+$$('#cmAdd').addEventListener('click', () => safe(openProviderEditor(null)));
+$$('#cmClose').addEventListener('click', () => cmOverlay.classList.add('hidden'));
+$$('#peCancel').addEventListener('click', () => peOverlay.classList.add('hidden'));
+$$('#cmList').addEventListener('click', (e) => {
+  const ed = e.target.closest('[data-pe-edit]');
+  if (ed) { safe(openProviderEditor(ed.dataset.peEdit)); return; }
+  const del = e.target.closest('[data-pe-del]');
+  if (del) safe(deleteProvider(del.dataset.peDel));
+});
+
+$$('#peTest').addEventListener('click', async () => {
+  const cfg = collectForm('peSchema');
+  $$('#peTest').disabled = true;
+  peMsg('测试中：用这份配置拉上游模型清单…');
+  try {
+    const res = await api('/core/channels/test', { method: 'POST', body: JSON.stringify(
+      { plugin_id: cmPlugin.plugin_id, channel_id: peEditing || '', config: cfg }) });
+    peModels = (res.models || []).map((m) => m.id || m).filter(Boolean);
+    peMsg(`${res.message} · 模型 ${peModels.length} 个${res.ok ? '，保存后生效' : ''}`, res.ok ? 'ok' : 'err');
+  } catch (err) { peMsg('测试失败：' + err.message, 'err'); }
+  finally { $$('#peTest').disabled = false; }
+});
+
+$$('#peSave').addEventListener('click', async () => {
+  const id = $$('#peID').value.trim(), name = $$('#peName').value.trim() || id;
+  const cfg = collectForm('peSchema');
+  if (!id) { peMsg('请填写渠道标识', 'err'); return; }
+  for (const k of cmPlugin?.config_schema?.required || []) {
+    if (cfg[k] == null || String(cfg[k]).trim() === '') { peMsg('请填写 ' + (cmPlugin.config_schema.properties?.[k]?.title || k), 'err'); return; }
+  }
+  $$('#peSave').disabled = true;
+  const isEdit = !!peEditing;   // 先记下：下面会把 peEditing 更新成新 ID，之后就不能再拿它判新增/编辑
+  try {
+    if (isEdit) {
+      // 带 channel_id = 改名请求（服务端会迁移账号/池/账本/规则，W3-45）
+      await api('/core/channels/' + encodeURIComponent(peEditing), { method: 'PUT', body: JSON.stringify(
+        { channel_id: id, display_name: name, config: cfg, ...(peModels.length ? { models: peModels } : {}) }) });
+      peEditing = id;   // 后续同一编辑器内的「显示密钥」请求要用新 ID
+    } else {
+      await api('/core/channels', { method: 'POST', body: JSON.stringify(
+        { channel_id: id, plugin_id: cmPlugin.plugin_id, display_name: name, config: cfg, models: peModels }) });
+    }
+    peOverlay.classList.add('hidden');
+    toast(isEdit ? 'Provider 已保存' : 'Provider 已添加', 'ok');
+    await Promise.all([reloadProviderRows(), loadAccounts()]);
+  } catch (err) { peMsg('保存失败：' + err.message, 'err'); }
+  finally { $$('#peSave').disabled = false; }
+});
+
+// 渠道配置表单仍用于需要 base_url/API Key 的单实例渠道（非 multi_channels 插件），不提供独立渠道管理页。
+async function loadChannels() { return loadChannelButtons(); }
+
+// ---------- 单实例渠道配置表单（由已安装插件的 config.schema 生成） ----------
 const wizard = $$('#channelWizard');
-let wizardStep = 0;
-let wizardCtx = { channels: [], plugins: [], selected: null, editing: null, formVals: {} };
+let wizardCtx = { editing: null, pluginID: null, pluginName: '', schema: null, formVals: {} };
 
 async function openChannelWizard(channelId) {
-  const plugins = await api('/core/plugins');
   const chans = await api('/core/channels');
-  wizardCtx = { channels: chans, plugins: plugins.filter((p) => p.kind === 'channel'), selected: channelId || null, editing: channelId || null, formVals: {} };
-  wizardStep = channelId ? 1 : 0;
-  $$('#cwTitle').textContent = channelId ? '编辑渠道' : '添加渠道';
+  const ch = chans.find((c) => c.channel_id === channelId);
+  if (!ch) throw new Error('渠道不存在或插件未安装：' + channelId);
+  const detail = await api('/core/channels/' + encodeURIComponent(channelId));
+  wizardCtx = { editing: channelId, pluginID: ch.plugin_id, pluginName: ch.display_name,
+    schema: detail.config_schema, formVals: detail.config || {} };
+  $$('#cwTitle').textContent = '配置 ' + (ch.display_name || ch.channel_id);
   wizard.classList.remove('hidden');
-  if (channelId) {
-    const ch = await api('/core/channels/' + channelId);
-    wizardCtx.pluginID = ch.plugin_id;
-    wizardCtx.schema = ch.config_schema;
-    wizardCtx.formVals = Object.assign({}, ch.config, { __name: ch.display_name });
-  }
   renderWizard();
 }
 
 // 由 JSON Schema 动态生成表单（支持 string/integer/number/boolean/array/object）
-function schemaForm(schema, vals, idPrefix) {
+//
+// revealFor 非空时，password 字段旁额外给一个「显示密钥」按钮：明文只能由用户显式点击
+// 向后端单独索取（W3-45），列表/详情接口永远只给脱敏值。
+function schemaForm(schema, vals, idPrefix, revealFor) {
   const props = (schema && schema.properties) || {};
   const req = (schema && schema.required) || [];
+  const html = (v) => esc(v);
   return Object.entries(props).map(([k, d]) => {
     const v = vals[k] == null ? (d.default == null ? '' : d.default) : vals[k];
     const label = (d.title || k) + (req.includes(k) ? ' *' : '');
     const id = idPrefix + k;
     if (Array.isArray(d.enum) && d.enum.length) {
       const names = Array.isArray(d.enumNames) ? d.enumNames : d.enum;
-      return `<label class="frow">${label}<select class="ipt" id="${id}" data-key="${k}" data-type="string">${d.enum.map((o, i) => `<option value="${o}" ${String(v) === String(o) ? 'selected' : ''}>${names[i] || o}</option>`).join('')}</select></label>`;
+      return `<label class="frow">${html(label)}<select class="ipt" id="${html(id)}" data-key="${html(k)}" data-type="string">${d.enum.map((o, i) => `<option value="${html(o)}" ${String(v) === String(o) ? 'selected' : ''}>${html(names[i] || o)}</option>`).join('')}</select></label>`;
     }
     if (d.type === 'boolean') {
-      return `<label class="frow"><input type="checkbox" id="${id}" data-key="${k}" data-type="boolean" ${v ? 'checked' : ''}> ${label}</label>`;
+      return `<label class="frow"><input type="checkbox" id="${html(id)}" data-key="${html(k)}" data-type="boolean" ${v ? 'checked' : ''}> ${html(label)}</label>`;
     }
     if (d.type === 'array') {
-      return `<label class="frow">${label}<input class="ipt" id="${id}" data-key="${k}" data-type="array" value="${Array.isArray(v) ? v.join(', ') : v}" placeholder="逗号分隔"></label>`;
+      return `<label class="frow">${html(label)}<input class="ipt" id="${html(id)}" data-key="${html(k)}" data-type="array" value="${html(Array.isArray(v) ? v.join(', ') : v)}" placeholder="逗号分隔"></label>`;
     }
     if (d.type === 'object') {
-      return `<label class="frow">${label}<input class="ipt" id="${id}" data-key="${k}" data-type="object" value='${typeof v === 'object' ? JSON.stringify(v) : v}' placeholder='{"Header":"值"}'></label>`;
+      return `<label class="frow">${html(label)}<input class="ipt" id="${html(id)}" data-key="${html(k)}" data-type="object" value="${html(typeof v === 'object' ? JSON.stringify(v) : v)}" placeholder='{"Header":"值"}'></label>`;
     }
     const t = d.format === 'password' ? 'password' : (d.type === 'integer' || d.type === 'number' ? 'number' : 'text');
     const ph = d.description || d.default || '';
-    return `<label class="frow">${label}<input class="ipt" id="${id}" data-key="${k}" data-type="${d.type || 'string'}" placeholder="${ph}" value="${v}"></label>`;
+    // 密钥字段：给一个显式「显示」开关（只在编辑已有实例、且当前值是脱敏值时才有意义）
+    const reveal = (revealFor && d.format === 'password')
+      ? `<button type="button" class="btn small" data-reveal="${html(k)}" title="从本机 core 取回明文（不经日志）">显示密钥</button>`
+      : '';
+    return `<label class="frow">${html(label)}<span class="ipt-row"><input class="ipt" id="${html(id)}" data-key="${html(k)}" data-type="${html(d.type || 'string')}" placeholder="${html(ph)}" value="${html(v)}">${reveal}</span></label>`;
   }).join('');
 }
 
@@ -418,85 +596,27 @@ function collectForm(idPrefix) {
 }
 
 function renderWizard() {
-  const body = $$('#cwBody');
-  const prev = $$('#cwPrev');
-  const next = $$('#cwNext');
-  prev.hidden = wizardStep === 0;
-  if (wizardStep === 0) {
-    next.hidden = false; next.textContent = '下一步';
-    const kinds = wizardCtx.plugins;
-    body.innerHTML = `
-      <div class="ov-note">选择要添加的渠道类型（来自已安装渠道插件；未安装请先到插件页安装）</div>
-      <div class="exit" id="typeGrid">${kinds.length === 0 ? '<div class="empty">尚未安装任何渠道插件</div>' : kinds.map((t) => `
-        <div class="plugin-card" data-type="${t.plugin_id}" style="cursor:pointer">
-          <div class="pl-title"><span class="ch-avatar" style="background:${t.color || CH_COLORS[chClass(t.plugin_id)] || '#52C41A'}">${(t.name || '?').slice(0, 1)}</span> ${t.name}</div>
-          <div class="pl-desc">${t.description || ''}</div><div class="pl-caps">${(t.capabilities || []).slice(0, 4).join(' · ')}</div>
-        </div>`).join('')}</div>`;
-    const typeGrid = body.querySelector('#typeGrid');
-    if (kinds.length === 1) wizardCtx.selected = kinds[0].plugin_id;
-    typeGrid.querySelectorAll('.plugin-card').forEach((c) => {
-      if (c.dataset.type === wizardCtx.selected) c.style.borderColor = 'var(--primary)';
-      c.addEventListener('click', async () => {
-        typeGrid.querySelectorAll('.plugin-card').forEach((x) => x.style.borderColor = '');
-        c.style.borderColor = 'var(--primary)';
-        wizardCtx.selected = c.dataset.type;
-        const pl = kinds.find((p) => p.plugin_id === c.dataset.type);
-        wizardCtx.pluginName = pl ? pl.name : c.dataset.type;
-        wizardCtx.schema = pl ? pl.config_schema : null;
-        wizardCtx.formVals = {};
-      });
-    });
-  } else {
-    next.hidden = false; next.textContent = wizardCtx.editing ? '保存' : '测试并保存';
-    const schema = wizardCtx.schema;
-    body.innerHTML = `
-      <div class="step-ind">${[0, 1, 2].map((i) => `<span class="step-dot ${i === 1 ? 'active' : ''}"></span>`).join('')}</div>
-      <div class="ov-note">配置 <b>${wizardCtx.pluginName || wizardCtx.pluginID || ''}</b>（表单由插件 config.schema 自动生成）</div>
-      <label class="frow">渠道显示名称<input class="ipt" id="f-name" value="${wizardCtx.formVals.__name || ''}" placeholder="例如：我的中转 API"></label>
-      <div id="fw">${schema ? schemaForm(schema, wizardCtx.formVals, 'sc_') : '<div class="ov-tip">该插件未提供 config.schema</div>'}</div>`;
-  }
+  $$('#cwNext').textContent = '保存';
+  $$('#cwBody').innerHTML = `
+    <div class="ov-note">配置 <b>${esc(wizardCtx.pluginName || wizardCtx.pluginID)}</b>（由插件 config.schema 生成）</div>
+    <div id="fw">${wizardCtx.schema ? schemaForm(wizardCtx.schema, wizardCtx.formVals, 'sc_') : '<div class="ov-tip">该插件未提供 config.schema</div>'}</div>`;
 }
 
 $$('#cwCancel').addEventListener('click', () => { wizard.classList.add('hidden'); });
-$$('#cwPrev').addEventListener('click', () => { wizardStep = 0; renderWizard(); });
 $$('#cwNext').addEventListener('click', async () => {
-  if (wizardStep === 0) {
-    if (!wizardCtx.selected) { toast('请选择渠道类型', 'warn'); return; }
-    wizardCtx.pluginID = wizardCtx.selected;
-    wizardStep = 1;
-    renderWizard();
-    return;
-  }
-  const displayName = ($$('#f-name') && $$('#f-name').value) || wizardCtx.pluginName || wizardCtx.pluginID;
   const cfg = collectForm('cwBody');
+  for (const k of wizardCtx.schema?.required || []) {
+    if (cfg[k] == null || String(cfg[k]).trim() === '') { toast('请填写 ' + (wizardCtx.schema.properties?.[k]?.title || k), 'warn'); return; }
+  }
   $$('#cwNext').disabled = true;
-  $$('#cwNext').textContent = '正在测试连接…';
   try {
-    if (wizardCtx.editing) {
-      await api('/core/channels/' + wizardCtx.editing, { method: 'PUT', body: JSON.stringify({ display_name: displayName, config: cfg }) });
-    } else {
-      const chID = wizardCtx.pluginID + '-' + Date.now().toString().slice(-5);
-      await api('/core/channels', { method: 'POST', body: JSON.stringify({ channel_id: chID, plugin_id: wizardCtx.pluginID, display_name: displayName, config: cfg }) });
-      // 真实测试连接（不 mock）：失败不回滚，仅提示
-      try { const t = await api('/core/channels/' + chID + '/test'); toast(t.message || '连接成功', 'ok'); }
-      catch (err) { toast('渠道已保存，但连接测试失败：' + err.message, 'warn'); }
-      // 需要登录的渠道（如 workbuddy 双区）：直接引导进入登录向导
-      const pl = (wizardCtx.plugins || []).find((p) => p.plugin_id === wizardCtx.pluginID);
-      if (pl && (pl.capabilities || []).includes('auth.begin') && await confirmBox('需要登录', '该渠道需要登录后才能使用，现在去登录？')) {
-        wizard.classList.add('hidden'); loadChannels(); loadAccounts();
-        openLoginWizard(chID);
-        return;
-      }
-    }
+    await api('/core/channels/' + encodeURIComponent(wizardCtx.editing), { method: 'PUT', body: JSON.stringify({ config: cfg }) });
     wizard.classList.add('hidden');
-    loadChannels();
-    loadAccounts();
+    toast('渠道配置已保存', 'ok');
+    safe(loadChannelButtons());
   } catch (err) { toast('保存失败：' + err.message, 'err'); }
-  finally { $$('#cwNext').disabled = false; $$('#cwNext').textContent = wizardCtx.editing ? '保存' : '测试并保存'; }
+  finally { $$('#cwNext').disabled = false; }
 });
-
-// 打开设置体的「添加渠道」按钮（全局）
-$$('#btnAddChannel').addEventListener('click', () => openChannelWizard(null));
 
 // ---------- Tab: 用量 ----------
 async function loadUsage() {
@@ -586,10 +706,17 @@ async function loadStats() {
   $$('#statsReqs').innerHTML = (rq || []).length ? `<div class="fee-card"><h4>最近请求</h4>
     <table class="fee-table"><tr><th>时刻</th><th>模型</th><th>渠道</th><th>状态</th><th>Token</th><th>耗时</th><th>首字</th></tr>
     ${rq.map((x) => `<tr><td>${x.ts}</td><td>${esc(x.model)}</td><td>${esc(x.channel || '—')}</td><td>${x.ok ? '✓' : `<span style="color:var(--danger)">${esc(x.err_kind || '错误')}</span>`}</td><td>${fmt.int(x.total_tokens)}</td><td>${x.time_ms ? x.time_ms + 'ms' : '—'}</td><td>${x.first_token_ms ? x.first_token_ms + 'ms' : '—'}</td></tr>`).join('')}</table></div>` : '';
+  // 失败汇总（W3-46）：来源是磁盘上的 fail/YYYYMMDD.jsonl，重启后仍在。
+  // 包含无法归渠道的失败（channel 为空 = 未路由成功），这是内存环形记不到的那一半。
+  const fl = await api('/core/logs/fails?days=1&limit=50').catch(() => []);
+  $$('#statsFails').innerHTML = (fl || []).length ? `<div class="fee-card"><h4>今日失败 <span class="chip warn">${fl.length}</span></h4>
+    <table class="fee-table"><tr><th>时刻</th><th>模型</th><th>渠道</th><th>错误</th><th>摘要</th><th>耗时</th></tr>
+    ${fl.map((x) => `<tr><td>${esc((x.ts || '').slice(11, 19))}</td><td>${esc(x.model)}</td><td>${esc(x.channel || '未路由')}</td><td><span style="color:var(--danger)">${esc(x.err_kind || '错误')}</span></td><td title="${esc(x.message || '')}">${esc((x.message || '').slice(0, 60))}</td><td>${x.time_ms ? x.time_ms + 'ms' : '—'}</td></tr>`).join('')}</table></div>` : '';
   $$('#warnings').innerHTML = `<div class="warn-title">⚠ 提醒</div><ul>${s.warnings.map((w) => `<li>${w}</li>`).join('')}</ul>`;
   const logs = await api('/core/logs');
   $$('#logView').textContent = logs.join('\n');
 }
+$$('#btnRefreshStats').addEventListener('click', () => safe(loadStats()));
 
 // ---------- Tab: 费率 ----------
 // effortCell 渲染思考档位（W3-32）。
@@ -655,7 +782,7 @@ function renderModelSearch(q) {
     }
   }));
   if (!rows.length) { $$('#msResult').innerHTML = '<div class="ov-note">没有匹配的模型</div>'; return; }
-  $$('#msResult').innerHTML = `<table class="fee-table"><tr><th>模型</th><th>渠道</th><th>输入(¥/k)</th><th>输出(¥/k)</th><th>上下文</th></tr>${rows.slice(0, 300).map((r) => `<tr data-model="${esc(r.m.id)}"><td>${esc(r.m.id)}</td><td><span class="chip" style="color:${CH_COLORS[chClass(r.ch)]}">${esc(r.ch)}</span></td><td>${fmt.yuan(r.m.input)}</td><td>${fmt.yuan(r.m.output)}</td><td>${fmt.int(r.m.context)}</td></tr>`).join('')}</table>`
+  $$('#msResult').innerHTML = `<table class="fee-table"><tr><th>模型</th><th>渠道</th><th>输入(¥/k)</th><th>输出(¥/k)</th><th>上下文</th></tr>${rows.slice(0, 300).map((r) => `<tr data-model="${esc(r.m.id)}"><td>${esc(r.m.id)}</td><td><span class="chip" style="color:${chColor(r.ch)}">${esc(r.ch)}</span></td><td>${fmt.yuan(r.m.input)}</td><td>${fmt.yuan(r.m.output)}</td><td>${fmt.int(r.m.context)}</td></tr>`).join('')}</table>`
     + (rows.length > 300 ? `<div class="ov-note">共 ${rows.length} 条，仅显示前 300 条（请输入更具体的关键字）</div>` : '');
 }
 $$('#btnModelSearch').addEventListener('click', () => safe(openModelSearch()));
@@ -682,34 +809,40 @@ function switchSub(sub) {
 }
 $$all('.subtab').forEach((b) => b.addEventListener('click', () => switchSub(b.dataset.sub)));
 
-async function loadStore(expand) {
-  // 清单是指针形态（每插件一个详情文件）时，首屏不展开：版本列表要点「选版本」才拉。
-  // 展开状态记在内存，刷新/装完插件后保持，不用反复点。
-  if (expand) storeExpanded = true;
-  const plugins = await api('/gw/plugins/store' + (storeExpanded ? '?expand=1' : ''));
-  const kindLabel = { channel: '渠道', hook: 'Hook', tool: '工具' };
+async function loadStore() {
+  // v2（W3-48）：注册表是平铺多文件，一次 tarball 拉全，每个插件自带全部 versions[]，
+  // 所以没有「指针详情/按需展开」这回事——首屏就是完整数据。
+  const plugins = await api('/gw/plugins/store');
+  const kindLabel = { channel: '渠道', hook: 'Hook', main: '主程序' };
   const cat = plugins.length ? plugins[0] : null;
+  let errs = [];
+  try { errs = await api('/gw/plugins/store/errors'); } catch (_) { errs = []; }
   $$('#subStore').innerHTML = `
     <div class="pa-group"><input class="ipt" id="storeSearch" placeholder="搜索插件…" style="width:220px">
       <button class="btn small" data-op="refresh-catalog">重新拉清单</button>
-      ${cat ? `<span class="tooltip-badge ${cat.catalog_signed ? 'ok' : 'warn'}">${cat.catalog_signed ? '清单已验签' : '清单未验签'}</span>
-        <span class="bar-label">来源 ${cat.catalog_source || '—'} · ${fmtCatTime(cat.catalog_updated_at)}</span>` : ''}</div>
+      ${cat ? `<span class="bar-label">来源 ${cat.catalog_source || '—'} · ${fmtCatTime(cat.catalog_updated_at)}</span>` : ''}
+      ${cat && cat.catalog_error ? `<span class="tooltip-badge warn" title="${cat.catalog_error}">清单拉取失败，显示上次快照</span>` : ''}
+      ${errs.length ? `<span class="tooltip-badge danger" id="storeErrs" style="cursor:pointer">${errs.length} 个注册条目有问题</span>` : ''}</div>
+    ${errs.length ? `<div class="exit" id="storeErrBox" style="display:none">${errs.map((e) => `<div class="bar-label">${e.file} · ${e.reason}</div>`).join('')}</div>` : ''}
     <div class="exit" id="storeGrid">${plugins.map((p) => `
       <div class="plugin-card">
         <div class="pl-title">${avatar(p.plugin_id, p.name)} ${p.name}
           <span class="pl-kind ${p.kind}">${kindLabel[p.kind] || p.kind}</span>
           ${p.status && p.status !== 'verified' ? `<span class="tooltip-badge warn">${p.status === 'official' ? '官方' : '未验证'}</span>` : ''}
+          ${p.installable === false ? '<span class="tooltip-badge danger">无可安装版本</span>' : ''}
           ${p.conformance && p.conformance.mode ? `<span class="tooltip-badge ${p.conformance.fail ? 'danger' : 'ok'}">准入 ${p.conformance.pass}/${p.conformance.pass + p.conformance.warn + p.conformance.fail}</span>` : ''}</div>
         <div class="pl-desc">${p.description}</div>
-        <div class="pl-meta">${p.plugin_id} · ${p.version || '未安装'}${p.latest ? ' → ' + p.latest : ''}<br>${p.source} · 作者 ${p.author}</div>
+        <div class="pl-meta">${p.plugin_id} · ${p.version || '未安装'}${p.latest ? ' → ' + p.latest : ''}<br>${p.repo || p.source} · 作者 ${p.author}</div>
         <div class="pl-actions">
           ${p.installed
             ? (p.latest && p.version !== p.latest ? `<button class="btn small primary" data-op="upgrade" data-pid="${p.plugin_id}">升级到 ${p.latest}</button>` : '<button class="btn small" disabled>已安装</button>')
-            : `<button class="btn small primary" data-op="install" data-pid="${p.plugin_id}">安装${p.latest ? ' ' + p.latest : ''}</button>`}
-          ${(p.versions || []).length > 1 ? `<select class="ipt small" data-ver="${p.plugin_id}">${p.versions.map((v) => `<option value="${v.version}" ${v.version === p.latest ? 'selected' : ''}>${v.version}${v.os ? ' · ' + v.os + '/' + v.arch : ''}</option>`).join('')}</select>`
-            : (p.detail === false ? `<button class="btn small" data-op="expand-versions">选版本…</button>` : '')}
+            : (p.installable === false ? '<button class="btn small" disabled>暂不可安装</button>'
+              : `<button class="btn small primary" data-op="install" data-pid="${p.plugin_id}">安装${p.latest ? ' ' + p.latest : ''}</button>`)}
+          ${(p.versions || []).length > 1 ? `<select class="ipt small" data-ver="${p.plugin_id}">${p.versions.map((v) => `<option value="${v.version}" ${v.version === p.latest ? 'selected' : ''}>${v.version}${v.os ? ' · ' + v.os + '/' + v.arch : ''}</option>`).join('')}</select>` : ''}
         </div>
       </div>`).join('')}</div>`;
+  const eb = $$('#storeErrs');
+  if (eb) eb.addEventListener('click', () => { const b = $$('#storeErrBox'); b.style.display = b.style.display === 'none' ? '' : 'none'; });
   $$('#storeSearch').addEventListener('input', (e) => {
     const q = e.target.value.toLowerCase();
     $$all('#storeGrid .plugin-card').forEach((c) => {
@@ -718,7 +851,6 @@ async function loadStore(expand) {
   });
 }
 // 清单拉取时间的人话化（只显示日期，够判断「多旧」）
-let storeExpanded = false;
 function fmtCatTime(iso) {
   if (!iso) return '清单时间未声明';
   const d = new Date(iso);
@@ -731,10 +863,9 @@ async function pluginAction(e) {
   const b = e.target.closest('[data-op]');
   if (!b) return;
   if (b.dataset.op === 'refresh-catalog') {
-    try { const r = await api('/gw/registry/refresh', { method: 'POST' }); toast(`${r.message}（${r.plugins} 个插件${r.signed ? ' · 已验签' : ' · 未验签'}）`, 'ok'); loadStore(); } catch (err) { toast('失败：' + err.message, 'err'); }
+    try { const r = await api('/gw/registry/refresh', { method: 'POST' }); toast(`${r.message}（${r.plugins} 个插件${r.errors ? ' · ' + r.errors + ' 个条目有问题' : ''}）`, 'ok'); loadStore(); } catch (err) { toast('失败：' + err.message, 'err'); }
     return;
   }
-  if (b.dataset.op === 'expand-versions') { safe(loadStore(true)); return; }
   const { op, pid } = b.dataset;
   if (op === 'uninstall' && !(await confirmBox('卸载插件', `确定卸载 ${pid}？<br><span class="ov-note">已登录的凭据与历史统计会保留，重装后可直接用。</span>`))) return;
   // 版本下拉（若该卡片有）决定装哪个版本；没选就走清单最新
@@ -743,7 +874,9 @@ async function pluginAction(e) {
   try {
     const r = await api('/gw/plugins/' + op, { method: 'POST', body: JSON.stringify({ plugin_id: pid, version }) });
     toast(r.message || '操作成功', 'ok');
-    loadStore();
+    await loadStore();
+    // 安装/卸载后 core 会重扫插件；短暂等待重启就绪，再刷新账号入口。
+    setTimeout(() => safe(loadAccounts()), 1200);
   } catch (err) { toast('失败：' + err.message, 'err'); }
 }
 $$('#subStore').addEventListener('click', pluginAction);
@@ -776,7 +909,7 @@ async function loadUpdates() {
       <div class="fee-card"><h4>ww3-core（ww3-core.exe）</h4>
         <div class="pl-meta">当前 v${core.current || '未知'} · 最新 v${core.latest || '未知'}
           ${core.update ? '<span class="tooltip-badge ok">可升级</span>' : ''}
-          ${core.catalog_signed ? '<span class="tooltip-badge ok">清单已验签</span>' : '<span class="tooltip-badge warn">清单未验签</span>'}</div>
+          ${core.version_gate && (core.version_gate.min || core.version_gate.max) ? `<span class="tooltip-badge">需 gateway ${core.version_gate.min || '—'} ~ ${core.version_gate.max || '—'}</span>` : ''}</div>
         ${core.error ? `<div class="ov-note" style="margin-top:6px;color:var(--danger)">清单：${core.error}</div>` : ''}
         ${core.changelog ? `<div class="ov-note" style="margin-top:6px">${core.changelog}</div>` : ''}
         ${st === 'downloading' ? `<div class="bar-chart" style="height:22px;align-items:center;margin:8px 0 0">
@@ -789,7 +922,7 @@ async function loadUpdates() {
           ${core.rollback_available || st === 'applied' ? `<button class="btn small" data-tgt="core" data-step="rollback">回滚</button>` : ''}
           <button class="btn small" data-tgt="refresh">重新检查</button>
         </div></div>
-      ${cat.source ? `<div class="bar-label">插件清单源 ${cat.source}${cat.signed ? ' · 已验签' : ' · 未验签'}${cat.fetched_at ? ' · ' + new Date(cat.fetched_at).toLocaleString() : ''}${cat.error ? ' · ' + cat.error : ''}</div>` : ''}
+      ${cat.source ? `<div class="bar-label">插件清单源 ${cat.source}${cat.fetched_at ? ' · ' + new Date(cat.fetched_at).toLocaleString() : ''}${cat.error ? ' · ' + cat.error : ''}</div>` : ''}
     </div>`;
   // 下载中自动续轮（不自动轮的话面板得手工刷）
   if (st === 'downloading') { clearTimeout(window.__updT); window.__updT = setTimeout(() => safe(loadUpdates), 1200); }
@@ -1007,8 +1140,8 @@ const HELP_HTML = `
   <div class="help-content">
     <h4>基本用法</h4>
     <ol>
-      <li>在「插件与更新」安装所需渠道插件（官方样板含 custom-api），再到「渠道管理」点「＋ 添加渠道」，用插件 <code>config.schema</code> 生成的表单填写 base_url / API Key。</li>
-      <li>需要登录的渠道在渠道卡片上点「登录」，按 <code>auth.methods</code> 返回的范式完成（浏览器、设备码、回调粘贴或凭据导入）。</li>
+      <li>在「插件与更新」安装渠道插件；账号管理页会自动出现该插件声明的渠道按钮。需要 API Key 的渠道点击按钮填写配置，其他渠道点击按钮开始登录。</li>
+      <li>添加账号在账号页点击对应渠道按钮，按插件 <code>auth.methods</code> 返回的范式登录（浏览器、设备码、回调粘贴或凭据导入）；自定义模型填写配置即可。</li>
       <li>把客户端的 <b>Base URL</b> 设为顶部显示的 OpenAI 接口地址，<b>API Key</b> 用顶部显示的值。</li>
       <li>可在「设置」中修改监听地址、API-Key、管理口令与开机自启；管理口令启用后本面板需要登录。</li>
     </ol>
@@ -1049,7 +1182,7 @@ $$('#btnAbout').addEventListener('click', () => {
 });
 $$('#aboutClose').addEventListener('click', () => $$('#aboutOverlay').classList.add('hidden'));
 
-// ---------- 登录授权（authflow 六范式驱动，见 docs/AUTH_FLOW.md） ----------
+// ---------- 登录授权（authflow 六范式驱动，见 protocol/docs/AUTH_FLOW.md） ----------
 // core 不认渠道，只按 method.type 决定 UI：device_poll/loopback_callback/cdp_capture 需要轮询，
 // 只有 loopback_callback 才有「粘贴回调地址」兜底（跨机场景）。
 const loginOv = $$('#loginOverlay');
